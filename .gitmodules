@@ -1,0 +1,3 @@
+[submodule "esco-skill_extractor"]
+	path = esco-skill_extractor
+	url = https://github.com/nikifori/esco-skill-extractor.git
