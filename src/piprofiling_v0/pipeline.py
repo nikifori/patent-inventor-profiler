@@ -63,7 +63,7 @@ def main():
         for j in range(len(batch)):
             batch[j]['skill_links'] = batch_skills[j]
             batch[j]['skill_labels'] = [
-                link2skill_mapper.link2skill(link) for link in batch_skills[j]
+                (link2skill_mapper.link2skill(link[0]), link[1]) for link in batch_skills[j]
             ]
     
     print(1)
