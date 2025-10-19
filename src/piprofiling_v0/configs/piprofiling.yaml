@@ -5,6 +5,12 @@ data_csv_path: "./data/test/ten-rows-template.csv"
 # skill extractor related parameters
 sentence_model: "all-MiniLM-L6-v2"
 device: "cuda" # or "cpu"
-skill_threshold: 0.6
+model_skill_threshold: 0.6
+actual_skill_threshold: null # if null, the top-1 returned skill will be used. If set to a value, all returned skills will be filtered based on this threshold.
 batch_size: 32
 link2skill_mapping_file: '/home/nikifori/Desktop/thesis/repo/resources/ESCO_link2skill_mapping.csv' # if None it will try to find the file in "project/resources/ESCO_link2skill_mapping.csv"
+inventor_vector_type: "soft" # whether being "soft", "hard" or "tfidf"
+
+# archetypal analysis related parameters
+num_archetypes: 3
+random_seed: 42

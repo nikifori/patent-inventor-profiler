@@ -10,7 +10,12 @@ import pandas as pd
 import torch
 
 from utils import load_config, override_config_values
-from pipeline_utils import load_data, Link2Skill_Mapping
+from pipeline_utils import (
+    load_data, 
+    Link2Skill_Mapping,
+    build_inventor_skill_df,
+    inventor_archetype_memberships
+)
 
 from esco_skill_extractor import SkillExtractor
 
@@ -43,7 +48,7 @@ def main():
     # Initializations ---------------------------------------------------------
     skill_extractor = SkillExtractor(
         model=config_values.get("model", "all-MiniLM-L6-v2"),
-        skills_threshold=config_values.get("skills_threshold", 0.6),
+        skills_threshold=config_values.get("model_skill_threshold", 0.6),
         device = "cuda" if config_values.get("device", None)=="cuda" and torch.cuda.is_available() else "cpu",
     )
 
@@ -66,6 +71,28 @@ def main():
                 (link2skill_mapper.link2skill(link[0]), link[1]) for link in batch_skills[j]
             ]
     
+    # filter out skills with similarity < onfig_values.get("actual_skill_threshold", None)
+    if config_values.get("actual_skill_threshold", None) is not None:
+        for patent in data:
+            valid_idx = [k for k, (_, score) in enumerate(patent['skill_links']) if score > config_values.get("actual_skill_threshold", None)]
+            patent['skill_links'] = [patent['skill_links'][k] for k in valid_idx]
+            patent['skill_labels'] = [patent['skill_labels'][k] for k in valid_idx]
+
+    inventor_skill_df = build_inventor_skill_df(
+        data = data,
+        mode = config_values.get("inventor_vector_type", "soft")
+    )
+
+    num_archetypes = int(config_values.get("num_archetypes", 3))
+
+    inventor_arche_df = inventor_archetype_memberships(
+        inventor_skill_df,
+        n_archetypes=num_archetypes,
+        random_state=config_values.get("random_seed", 42),
+        backend="numpy",
+        init="uniform",
+    )
+
     print(1)
 
     # TODO build the table Inventors X Skills
