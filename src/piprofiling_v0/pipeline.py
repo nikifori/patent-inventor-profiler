@@ -8,6 +8,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 from utils import load_config, override_config_values
 from pipeline_utils import (
@@ -45,6 +46,14 @@ def main():
 
     data = load_data(config_values.get("data_csv_path", None))
 
+    # Checks ---------------------------------------------------------
+    num_archetypes = int(config_values.get("num_archetypes", 3))
+    iter_per_num_archetypes = config_values.get("iter_per_num_archetypes", 1)
+    alternative_random_seeds = config_values.get("alternative_random_seeds", [])
+
+    if num_archetypes == -1 and iter_per_num_archetypes > 1:
+        assert len(alternative_random_seeds) >=  iter_per_num_archetypes - 1, "Not enough alternative random seeds provided."
+
     # Initializations ---------------------------------------------------------
     skill_extractor = SkillExtractor(
         model=config_values.get("model", "all-MiniLM-L6-v2"),
@@ -56,7 +65,7 @@ def main():
     # -------------------------------------------------------------------------
 
     batch_size = config_values.get("batch_size", 32)
-    for i in range(0, len(data), batch_size):
+    for i in tqdm(range(0, len(data), batch_size)):
         batch = data[i:i + batch_size]
         batch_text = [
             patent['Title'] + " " + patent['Abstract'] 
@@ -71,7 +80,7 @@ def main():
                 (link2skill_mapper.link2skill(link[0]), link[1]) for link in batch_skills[j]
             ]
     
-    # filter out skills with similarity < onfig_values.get("actual_skill_threshold", None)
+    # filter out skills with similarity < config_values.get("actual_skill_threshold", None)
     if config_values.get("actual_skill_threshold", None) is not None:
         for patent in data:
             valid_idx = [k for k, (_, score) in enumerate(patent['skill_links']) if score > config_values.get("actual_skill_threshold", None)]
@@ -83,19 +92,18 @@ def main():
         mode = config_values.get("inventor_vector_type", "soft")
     )
 
-    num_archetypes = int(config_values.get("num_archetypes", 3))
-
     inventor_arche_df = inventor_archetype_memberships(
         inventor_skill_df,
         n_archetypes=num_archetypes,
         random_state=config_values.get("random_seed", 42),
+        alternative_random_seeds=alternative_random_seeds,
+        iter_per_num_archetypes=iter_per_num_archetypes,
         backend="numpy",
         init="uniform",
+        output_dir=config_values.get("output_dir", "./output")
     )
 
     print(1)
-
-    # TODO build the table Inventors X Skills
 
 
 if __name__ == '__main__':

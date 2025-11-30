@@ -1,5 +1,7 @@
 # data related parameters
-data_csv_path: "./data/test/ten-rows-template.csv"
+data_csv_path: "./data/patent-query-over-2017-llm-filtered-GREEN_small_500.csv"
+# data_csv_path: "./data/patent-query-over-2017-llm-filtered-GREEN.csv"
+# data_csv_path: "./data/test/ten-rows-template.csv"
 # data_csv_path: "./data/test/lens-export.jsonl"
 
 # skill extractor related parameters
@@ -7,10 +9,15 @@ sentence_model: "all-MiniLM-L6-v2"
 device: "cuda" # or "cpu"
 model_skill_threshold: 0.6
 actual_skill_threshold: null # if null, the top-1 returned skill will be used. If set to a value, all returned skills will be filtered based on this threshold.
-batch_size: 32
+batch_size: 1000
 link2skill_mapping_file: '/home/nikifori/Desktop/thesis/repo/resources/ESCO_link2skill_mapping.csv' # if None it will try to find the file in "project/resources/ESCO_link2skill_mapping.csv"
 inventor_vector_type: "soft" # whether being "soft", "hard" or "tfidf"
 
 # archetypal analysis related parameters
-num_archetypes: 3
+num_archetypes: -1 # -1 stands for auto decide based on elbow method (scree plot)
+iter_per_num_archetypes: 1 # if num_archetypes is -1 iter_per_num_archetypes will designate how many times per num_archetypes will the AA be run to choose the best one
 random_seed: 42
+alternative_random_seeds: [ 7, 21, 35, 84, 45, 43, 100 ] # in case iter_per_num_archetypes > 1
+
+# output related parameters
+output_dir: "./output/test"

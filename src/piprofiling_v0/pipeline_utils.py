@@ -7,10 +7,11 @@
 import pandas as pd
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Iterable, Optional
+from typing import Dict, Any, List, Tuple, Iterable, Optional, Sequence
 import json
 import os
 import numpy as np
+from tqdm import tqdm
 
 
 class Link2Skill_Mapping:
@@ -205,10 +206,13 @@ def inventor_archetype_memberships(
     inventor_skill_df: pd.DataFrame,
     n_archetypes: int,
     random_state: Optional[int] = 42,
+    alternative_random_seeds: Optional[List[int]] = None,
+    iter_per_num_archetypes: int = 1,
     backend: str = "numpy",     # one of: "numpy", "jax", "torch"
     init: str = "uniform",      # see archetypes docs: 'uniform', 'furthest_sum', 'furthest_first', 'aa_plus_plus'
     max_iter: int = 300,
     tol: float = 1e-4,
+    output_dir: str = "./output",
 ) -> pd.DataFrame:
     """
     Fit Archetypal Analysis on an inventor×skill matrix and return per-inventor
@@ -219,9 +223,20 @@ def inventor_archetype_memberships(
     inventor_skill_df : pd.DataFrame
         Rows = inventors, columns = skills. Values can be counts, TF-IDF, or soft scores.
     n_archetypes : int
-        Number of archetypes to learn.
+        Number of archetypes to learn. If set to -1, an optimal number in [2, 15]
+        (bounded additionally by n_samples) is selected automatically using an
+        elbow rule on the (mean) residual sum of squares (RSS) curve. The elbow
+        plot is saved as a PNG in `output_dir` for debugging.
     random_state : Optional[int]
-        For reproducibility.
+        For reproducibility. Used for the first run per candidate k.
+    alternative_random_seeds : Optional[List[int]]
+        Seeds used for additional runs when `iter_per_num_archetypes > 1`.
+        They are consumed in order for the 2nd, 3rd, ... runs per k.
+        If there are more iterations than seeds, the remaining runs use `None`.
+    iter_per_num_archetypes : int
+        Number of AA runs (with different random_state) per candidate k
+        when `n_archetypes == -1`. If 1, only `random_state` is used.
+
     backend : {"numpy","jax","torch"}
         Which backend to use from the `archetypes` package.
     init : str
@@ -230,6 +245,8 @@ def inventor_archetype_memberships(
         Max iterations.
     tol : float
         Convergence tolerance.
+    output_dir : str
+        Directory where the elbow plot will be saved when `n_archetypes == -1`.
 
     Returns
     -------
@@ -243,37 +260,197 @@ def inventor_archetype_memberships(
 
     # Select backend
     if backend == "numpy":
-        from archetypes import AA
+        from archetypes import AA as AA_cls
     elif backend == "jax":
-        from archetypes.jax import AA
+        from archetypes.jax import AA as AA_cls
     elif backend == "torch":
-        from archetypes.torch import AA
+        from archetypes.torch import AA as AA_cls
     else:
         raise ValueError("backend must be one of: 'numpy', 'jax', 'torch'")
 
-    # Prepare data
     X = inventor_skill_df.values.astype(float, copy=False)
+    n_samples = X.shape[0]
 
-    # Fit AA
-    aa = AA(
-        n_archetypes=n_archetypes,
-        max_iter=max_iter,
-        tol=tol,
-        init=init,
-        random_state=random_state,
-    )
-    aa.fit(X)
+    # Helper to compute RSS (residual sum of squares) robustly
+    def _compute_rss(model, data: np.ndarray) -> float:
+        rss_attr = getattr(model, "rss_", None)
+        if rss_attr is not None:
+            return float(rss_attr)
 
-    # The estimator exposes per-sample coefficients in `coefficients_` (shape: n_samples×n_archetypes).
-    # We row-normalize them to sum to 1 (then scale to 0..100).
-    coeff = np.asarray(aa.coefficients_, dtype=float)  # (n_samples, k)
+        recon_err = getattr(model, "reconstruction_error_", None)
+        if recon_err is not None:
+            return float(recon_err)
+
+        coeff = np.asarray(model.coefficients_, dtype=float)
+        archetypes_mat = np.asarray(model.archetypes_, dtype=float)
+        X_hat = coeff @ archetypes_mat
+        err_norm = np.linalg.norm(data - X_hat, ord="fro")
+        return float(err_norm ** 2)
+
+    # Simple wrapper to fit a model with given k and seed and return (model, rss)
+    def _fit_aa_with_rss(k: int, seed: Optional[int]):
+        aa = AA_cls(
+            n_archetypes=k,
+            max_iter=max_iter,
+            tol=tol,
+            init=init,
+            random_state=seed,
+            method_kwargs={
+                "max_iter_optimizer": 5000,
+            },
+        )
+        aa.fit(X)
+        rss_val = _compute_rss(aa, X)
+        return aa, rss_val
+
+    # Case 1: user specified a fixed number of archetypes → original behaviour
+    if n_archetypes != -1:
+        aa, _ = _fit_aa_with_rss(n_archetypes, random_state)
+
+        coeff = np.asarray(aa.coefficients_, dtype=float)  # (n_samples, k)
+        row_sums = coeff.sum(axis=1, keepdims=True)
+        safe_row_sums = np.where(row_sums == 0.0, 1.0, row_sums)
+        probs = coeff / safe_row_sums
+        perc = probs * 100.0
+
+        k = coeff.shape[1]
+        columns = [f"Archetype_{i+1}" for i in range(k)]
+        return pd.DataFrame(perc, index=inventor_skill_df.index, columns=columns)
+
+    # Case 2: automatic selection of n_archetypes via elbow on RSS curve
+    # ------------------------------------------------------------------
+    # Range proposal: 2..15 is standard for elbow methods; we also bound by n_samples.
+    k_min = 2
+    k_max = min(45, max(2, n_samples))  # ensure at least 2 if n_samples >= 2
+
+    if n_samples < 2:
+        aa, _ = _fit_aa_with_rss(1, random_state)
+        coeff = np.asarray(aa.coefficients_, dtype=float)
+        row_sums = coeff.sum(axis=1, keepdims=True)
+        safe_row_sums = np.where(row_sums == 0.0, 1.0, row_sums)
+        probs = coeff / safe_row_sums
+        perc = probs * 100.0
+        columns = ["Archetype_1"]
+        return pd.DataFrame(perc, index=inventor_skill_df.index, columns=columns)
+
+    candidate_ks = list(range(k_min, k_max + 1))
+
+    if alternative_random_seeds is None:
+        alternative_random_seeds = [7, 21, 35, 84, 45, 43, 100]
+
+    base_seeds = [random_state] + list(alternative_random_seeds)
+    n_runs = max(1, int(iter_per_num_archetypes))
+
+    mean_rss_per_k: List[float] = []
+    best_model_per_k: Dict[int, Any] = {}
+
+    for k in tqdm(candidate_ks):
+        rss_values: List[float] = []
+        best_model_k = None
+        best_rss_k = np.inf
+
+        for run_idx in range(n_runs):
+            seed = base_seeds[run_idx] if run_idx < len(base_seeds) else None
+            aa_k, rss_k = _fit_aa_with_rss(k, seed)
+            rss_values.append(rss_k)
+
+            if rss_k < best_rss_k:
+                best_rss_k = rss_k
+                best_model_k = aa_k
+
+        mean_rss = float(sum(rss_values) / len(rss_values))
+        mean_rss_per_k.append(mean_rss)
+        best_model_per_k[k] = best_model_k
+
+    # Try to use kneed.KneeLocator if available for elbow detection
+    best_k = None
+    try:
+        from kneed import KneeLocator  # type: ignore
+
+        x = np.array(candidate_ks, dtype=float)
+        y = np.array(mean_rss_per_k, dtype=float)
+
+        kneedle = KneeLocator(
+            x,
+            y,
+            curve="convex",
+            direction="decreasing",
+        )
+        knee_x = kneedle.elbow or kneedle.knee
+
+        if knee_x is not None:
+            knee_rounded = int(round(float(knee_x)))
+            if knee_rounded < k_min:
+                knee_rounded = k_min
+            if knee_rounded > k_max:
+                knee_rounded = k_max
+            if knee_rounded in best_model_per_k:
+                best_k = knee_rounded
+    except Exception:
+        best_k = None
+
+    if best_k is None:
+        # Fallback elbow detection: "farthest point from the chord"
+        x = np.array(candidate_ks, dtype=float)
+        y = np.array(mean_rss_per_k, dtype=float)
+
+        x0, y0 = x[0], y[0]
+        x1, y1 = x[-1], y[-1]
+        vx, vy = x1 - x0, y1 - y0
+        denom = (vx ** 2 + vy ** 2) ** 0.5 or 1.0
+
+        distances = []
+        for xi, yi in zip(x[1:-1], y[1:-1]):
+            px, py = xi - x0, yi - y0
+            cross = abs(px * vy - py * vx)
+            distances.append(cross / denom)
+
+        if distances:
+            max_idx = int(np.argmax(distances))
+            best_k = int(x[1 + max_idx])
+        else:
+            best_k = candidate_ks[0]
+
+    # --- Save elbow plot for debugging ---
+    try:
+        from pathlib import Path as _Path
+        import matplotlib.pyplot as plt
+
+        out_dir_path = _Path(output_dir)
+        out_dir_path.mkdir(parents=True, exist_ok=True)
+        fig_path = out_dir_path / "elbow_n_archetypes.png"
+
+        plt.figure()
+        plt.plot(candidate_ks, mean_rss_per_k, marker="o")
+        plt.xlabel("Number of archetypes (k)")
+        plt.ylabel("Mean RSS")
+        plt.title("Elbow plot for AA (k vs mean RSS)")
+
+        # Mark chosen k
+        if best_k is not None:
+            best_idx = candidate_ks.index(best_k)
+            plt.scatter(
+                [candidate_ks[best_idx]],
+                [mean_rss_per_k[best_idx]],
+                marker="x",
+                s=100,
+            )
+        plt.grid(True, linestyle="--", alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+    except Exception:
+        # Plotting is only for debugging; ignore any failures.
+        pass
+
+    # Use the best model we already fitted for best_k
+    final_model = best_model_per_k[best_k]
+    coeff = np.asarray(final_model.coefficients_, dtype=float)
     row_sums = coeff.sum(axis=1, keepdims=True)
-    # Avoid division by zero: if a row sums to 0, keep it as zeros
     safe_row_sums = np.where(row_sums == 0.0, 1.0, row_sums)
     probs = coeff / safe_row_sums
     perc = probs * 100.0
 
-    # Build a tidy DataFrame
     k = coeff.shape[1]
     columns = [f"Archetype_{i+1}" for i in range(k)]
     memberships_df = pd.DataFrame(perc, index=inventor_skill_df.index, columns=columns)
