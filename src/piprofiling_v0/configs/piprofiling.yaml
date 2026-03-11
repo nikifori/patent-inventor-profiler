@@ -1,6 +1,7 @@
 # data related parameters
-data_csv_path: "./data/patent-query-over-2017-llm-filtered-GREEN_small_500.csv"
+# data_csv_path: "./data/patent-query-over-2017-llm-filtered-GREEN_small_500.csv"
 # data_csv_path: "./data/patent-query-over-2017-llm-filtered-GREEN.csv"
+data_csv_path: "./data/patent-query-over-2017-llm-filtered-GREEN_deduped.csv"
 # data_csv_path: "./data/test/ten-rows-template.csv"
 # data_csv_path: "./data/test/lens-export.jsonl"
 
@@ -11,13 +12,20 @@ model_skill_threshold: 0.6
 actual_skill_threshold: null # if null, the top-1 returned skill will be used. If set to a value, all returned skills will be filtered based on this threshold.
 batch_size: 1000
 link2skill_mapping_file: '/home/nikifori/Desktop/thesis/repo/resources/ESCO_link2skill_mapping.csv' # if None it will try to find the file in "project/resources/ESCO_link2skill_mapping.csv"
-inventor_vector_type: "soft" # whether being "soft", "hard" or "tfidf"
+inventor_vector_type: "tfidf" # whether being "soft", "hard" or "tfidf"
+save_patent_X_skills_csv: true
 
 # archetypal analysis related parameters
 num_archetypes: -1 # -1 stands for auto decide based on elbow method (scree plot)
 iter_per_num_archetypes: 1 # if num_archetypes is -1 iter_per_num_archetypes will designate how many times per num_archetypes will the AA be run to choose the best one
 random_seed: 42
 alternative_random_seeds: [ 7, 21, 35, 84, 45, 43, 100 ] # in case iter_per_num_archetypes > 1
+max_k: 30 # the maximum number of archetypes to try in case num_archetypes is -1
+n_init: 10 # Number of time the archetype analysis algorithm will be run with different initializations. The final results will be the best output of n_init consecutive runs.
+method: "nnls" # method: str, default='nnls' The optimization method to use for the archetypes and the coefficients, must be one of the following: 'nnls', 'pgd', 'pseudo_pgd'. See :ref:`optimization-methods`.
+backend: "numpy" # one of: "numpy", "jax", "torch"
+init: "uniform" # see archetypes docs: 'uniform', 'furthest_sum', 'furthest_first', 'aa_plus_plus'
 
 # output related parameters
-output_dir: "./output/test"
+# output_dir: "./output/test"
+output_dir: "./output/all_data_dedupled_tfidf_v4"
