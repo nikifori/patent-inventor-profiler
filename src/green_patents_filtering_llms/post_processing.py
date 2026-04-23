@@ -11,8 +11,9 @@ import re
 import unicodedata
 
 # --- Hardcoded inputs ---
-CSV_PATH = Path("/home/nikifori/Desktop/thesis/repo/data/patent-query-over-2017-llm-filtered.csv")
-ENSEMBLE_COL = "Ensemble_Final_Label"  # exact column name
+CSV_PATH = Path("/home/nikifori/Desktop/thesis/repo/data/patent-query-over-2017-llm-filtered-GREEN_v2.csv")
+# ENSEMBLE_COL = "Ensemble_Final_Label"  # exact column name
+ENSEMBLE_COL = "Label_File1"  # exact column name
 CSV_DELIM = ","
 
 # --- Dedup config ---

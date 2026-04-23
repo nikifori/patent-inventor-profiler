@@ -15,9 +15,22 @@ import platform
 import hashlib
 import sys
 import time
+import types
+import importlib
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from tqdm import tqdm
+
+import matplotlib
+matplotlib.use("Agg", force=True)
+
+import matplotlib.pyplot as plt
+from sklearn.manifold import Isomap, TSNE
+from sklearn.decomposition import PCA, TruncatedSVD
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from scipy import sparse
+from archetypes.visualization.simplex import simplex
+import umap
 
 
 class Link2Skill_Mapping:
@@ -168,6 +181,33 @@ def _to_numpy_array(value: Any, dtype: Optional[np.dtype] = None) -> np.ndarray:
     return arr
 
 
+def _load_installed_torch_archetypal_analysis():
+    """
+    Load `archetypal_analysis` from installed editable `archetypes` package.
+    Returns (callable, module_path).
+    """
+    try:
+        torch_mod = importlib.import_module("archetypes.torch")
+        fn = getattr(torch_mod, "archetypal_analysis", None)
+        if fn is not None:
+            return fn, "archetypes.torch"
+    except Exception:
+        pass
+
+    for module_name in ("archetypes.torch._AA", "archetypes.torch._aa"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        fn = getattr(module, "archetypal_analysis", None)
+        if fn is not None:
+            return fn, module_name
+    raise ImportError(
+        "Could not import `archetypal_analysis` from installed archetypes package. "
+        "Tried: archetypes.torch._AA, archetypes.torch._aa"
+    )
+
+
 def _fingerprint_inventor_skill_df(df: pd.DataFrame) -> str:
     hasher = hashlib.sha256()
     hasher.update(f"shape:{df.shape}".encode("utf-8"))
@@ -211,8 +251,6 @@ def _save_model_npz(path: Path, model: Any, rss: float, k: int) -> None:
 
 
 def _save_elbow_plot(fig_path: Path, candidate_ks: List[int], mean_rss_per_k: List[float], best_k: Optional[int]) -> None:
-    import matplotlib.pyplot as plt
-
     fig_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure()
     plt.plot(candidate_ks, mean_rss_per_k, marker="o")
@@ -231,6 +269,1523 @@ def _save_elbow_plot(fig_path: Path, candidate_ks: List[int], mean_rss_per_k: Li
     plt.tight_layout()
     plt.savefig(fig_path, dpi=150)
     plt.close()
+
+
+_ARCHETYPE_PLOT_STYLE = {
+    "font.family": "DejaVu Sans",
+    "font.size": 13,
+    "axes.titlesize": 18,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 10,
+    "figure.facecolor": "#eef3f8",
+    "axes.facecolor": "#f8fbff",
+}
+
+
+def _aa_with_k_suffix(path: Path, selected_k: int) -> Path:
+    return path.with_name(f"{path.stem}_k{selected_k}{path.suffix}")
+
+
+def _cosine_similarity_rows(matrix: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    safe_norms = np.where(norms == 0.0, 1.0, norms)
+    normalized = matrix / safe_norms
+    return normalized @ normalized.T
+
+
+def _sample_indices_by_group(groups: np.ndarray, max_points: int, random_state: int) -> np.ndarray:
+    n = len(groups)
+    if max_points <= 0 or n <= max_points:
+        return np.arange(n, dtype=int)
+
+    rng = np.random.default_rng(random_state)
+    sampled = []
+    group_ids, group_counts = np.unique(groups, return_counts=True)
+    proportions = group_counts / group_counts.sum()
+
+    for gid, p in zip(group_ids, proportions):
+        idx = np.flatnonzero(groups == gid)
+        take = max(1, int(round(max_points * p)))
+        take = min(take, len(idx))
+        chosen = rng.choice(idx, size=take, replace=False)
+        sampled.append(chosen)
+
+    sampled_idx = np.unique(np.concatenate(sampled))
+    if len(sampled_idx) > max_points:
+        sampled_idx = rng.choice(sampled_idx, size=max_points, replace=False)
+    elif len(sampled_idx) < max_points:
+        remaining = np.setdiff1d(np.arange(n), sampled_idx)
+        need = min(max_points - len(sampled_idx), len(remaining))
+        if need > 0:
+            extra = rng.choice(remaining, size=need, replace=False)
+            sampled_idx = np.concatenate([sampled_idx, extra])
+    return np.sort(sampled_idx)
+
+
+def _pad_embedding(embedding: np.ndarray, target_dims: int) -> np.ndarray:
+    if embedding.ndim != 2:
+        raise ValueError(f"Expected 2D embedding array, got shape {embedding.shape}")
+    if embedding.shape[1] >= target_dims:
+        return embedding[:, :target_dims]
+    pad_width = target_dims - embedding.shape[1]
+    return np.pad(embedding, ((0, 0), (0, pad_width)), mode="constant", constant_values=0.0)
+
+
+def _compute_tsne_embedding(
+    coefficients: np.ndarray,
+    n_components: int,
+    random_state: int,
+) -> Tuple[Optional[np.ndarray], Optional[float]]:
+    n_sample = coefficients.shape[0]
+    if n_sample < 2:
+        return None, None
+
+    perplexity_floor = max(5, n_sample // 40)
+    perplexity = float(min(35, max(1, n_sample - 1), perplexity_floor))
+    embedding = TSNE(
+        n_components=int(n_components),
+        perplexity=perplexity,
+        learning_rate="auto",
+        init="pca",
+        random_state=int(random_state),
+    ).fit_transform(coefficients)
+    return embedding, perplexity
+
+
+def _compute_pca_embedding(
+    coefficients: np.ndarray,
+    n_components: int,
+    random_state: int,
+) -> Tuple[np.ndarray, List[float]]:
+    max_components = max(1, min(int(n_components), coefficients.shape[0], coefficients.shape[1]))
+    pca = PCA(n_components=max_components, random_state=int(random_state))
+    embedding = pca.fit_transform(coefficients)
+    explained = [float(v) for v in pca.explained_variance_ratio_]
+    if len(explained) < n_components:
+        explained.extend([0.0] * (n_components - len(explained)))
+    return _pad_embedding(embedding, n_components), explained[:n_components]
+
+
+def _compute_isomap_embedding(
+    coefficients: np.ndarray,
+    n_components: int,
+) -> Tuple[Optional[np.ndarray], Optional[int]]:
+    n_sample = coefficients.shape[0]
+    if n_sample < 2:
+        return None, None
+
+    n_neighbors = max(1, min(15, n_sample - 1))
+    max_components = max(1, min(int(n_components), n_sample - 1, coefficients.shape[1]))
+    embedding = Isomap(n_components=max_components, n_neighbors=n_neighbors).fit_transform(coefficients)
+    return _pad_embedding(embedding, n_components), n_neighbors
+
+
+def _plot_embedding_2d(
+    embedding: np.ndarray,
+    dominant: np.ndarray,
+    out_path: Path,
+    k: int,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        cmap = plt.get_cmap("tab20", max(k, 1))
+        fig, ax = plt.subplots(figsize=(12, 9))
+        for arch_id in range(1, k + 1):
+            mask = dominant == arch_id
+            if not np.any(mask):
+                continue
+            ax.scatter(
+                embedding[mask, 0],
+                embedding[mask, 1],
+                s=14,
+                alpha=0.58,
+                color=cmap(arch_id - 1),
+                label=f"A{arch_id}",
+            )
+            center = embedding[mask].mean(axis=0)
+            ax.scatter(
+                center[0],
+                center[1],
+                marker="X",
+                s=180,
+                color=cmap(arch_id - 1),
+                edgecolor="black",
+                linewidth=0.8,
+            )
+            ax.text(center[0], center[1], f"A{arch_id}", fontsize=10, fontweight="bold", va="bottom")
+
+        ax.set_title(title, pad=12, fontweight="bold")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.25)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(loc="best", ncols=2, frameon=True, facecolor="#ffffff", edgecolor="#dbe3ee")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
+def _plot_embedding_3d(
+    embedding: np.ndarray,
+    dominant: np.ndarray,
+    out_path: Path,
+    k: int,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    zlabel: str,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        cmap = plt.get_cmap("tab20", max(k, 1))
+        fig = plt.figure(figsize=(13, 10))
+        ax = fig.add_subplot(111, projection="3d")
+        for arch_id in range(1, k + 1):
+            mask = dominant == arch_id
+            if not np.any(mask):
+                continue
+            ax.scatter(
+                embedding[mask, 0],
+                embedding[mask, 1],
+                embedding[mask, 2],
+                s=10,
+                alpha=0.45,
+                color=cmap(arch_id - 1),
+                label=f"A{arch_id}",
+            )
+            center = embedding[mask].mean(axis=0)
+            ax.scatter(
+                center[0],
+                center[1],
+                center[2],
+                marker="X",
+                s=220,
+                color=cmap(arch_id - 1),
+                edgecolor="black",
+                linewidth=0.8,
+            )
+
+        ax.set_title(title, pad=12, fontweight="bold")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_zlabel(zlabel)
+        ax.legend(loc="upper left", ncols=2, frameon=True, facecolor="#ffffff", edgecolor="#dbe3ee")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
+def _plot_archetype_counts(dominant: np.ndarray, out_path: Path, k: int) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    counts = pd.Series(dominant).value_counts().reindex(range(1, k + 1), fill_value=0)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(11, 6.5))
+        bars = ax.bar(
+            [f"A{i}" for i in counts.index],
+            counts.values,
+            color="#457b9d",
+            edgecolor="#ffffff",
+            linewidth=0.9,
+        )
+        ax.set_title("Inventors per Dominant Archetype", pad=12, fontweight="bold")
+        ax.set_xlabel("Archetype")
+        ax.set_ylabel("Inventor count")
+        ax.grid(axis="y", alpha=0.25)
+        for bar, val in zip(bars, counts.values):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height(),
+                f"{int(val)}",
+                ha="center",
+                va="bottom",
+                fontsize=10,
+            )
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
+def _plot_archetype_similarity_heatmap(similarity: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(similarity, cmap="viridis", vmin=0.0, vmax=1.0)
+        ax.set_title("Archetype Cosine Similarity (skill-space)", pad=12, fontweight="bold")
+        ticks = np.arange(similarity.shape[0])
+        labels = [f"A{i+1}" for i in ticks]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels)
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(labels)
+        for i in range(similarity.shape[0]):
+            for j in range(similarity.shape[1]):
+                val = similarity[i, j]
+                txt_color = "white" if val < 0.55 else "black"
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=9, color=txt_color)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("cosine similarity")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
+def _save_top_features_csv(
+    archetypes: np.ndarray,
+    feature_names: List[str],
+    out_path: Path,
+    top_n: int = 25,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for i in range(archetypes.shape[0]):
+        arch_label = f"Archetype_{i+1}"
+        scores = pd.Series(archetypes[i], index=feature_names)
+        top = scores.sort_values(ascending=False).head(top_n)
+        for rank, (feature, value) in enumerate(top.items(), start=1):
+            rows.append(
+                {
+                    "archetype": arch_label,
+                    "rank": rank,
+                    "feature": feature,
+                    "weight": float(value),
+                }
+            )
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+
+
+def _draft_archetype_category(top_feature: str) -> str:
+    top_feature_l = top_feature.lower()
+    if "wind" in top_feature_l:
+        return "Wind"
+    if "photovoltaic" in top_feature_l or "solar" in top_feature_l:
+        return "Solar"
+    if "vehicle" in top_feature_l or "battery" in top_feature_l:
+        return "EV / Vehicle / Storage"
+    if "system" in top_feature_l or "control" in top_feature_l:
+        return "Systems / Control"
+    return "Other"
+
+
+def _run_archetype_optical_analysis(
+    *,
+    coefficients: np.ndarray,
+    archetypes: np.ndarray,
+    inventor_index: pd.Index,
+    feature_names: List[str],
+    selected_k: int,
+    output_dir: Path,
+    random_state: int,
+    max_inventors_tsne: int,
+    metadata: Dict[str, Any],
+) -> Path:
+    if coefficients.ndim != 2 or archetypes.ndim != 2:
+        raise ValueError("Expected 2D coefficient and archetype matrices for optical analysis.")
+    if coefficients.shape[0] != len(inventor_index):
+        raise ValueError(
+            "Mismatch between coefficient rows and inventor index rows: "
+            f"{coefficients.shape[0]} vs {len(inventor_index)}"
+        )
+    if archetypes.shape[1] != len(feature_names):
+        raise ValueError(
+            "Mismatch between archetype features and inventor skill columns: "
+            f"{archetypes.shape[1]} vs {len(feature_names)}"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dominant = np.argmax(coefficients, axis=1) + 1
+    sample_idx = _sample_indices_by_group(dominant, max_inventors_tsne, random_state)
+    coeff_sample = coefficients[sample_idx]
+    dominant_sample = dominant[sample_idx]
+
+    tsne_2d = None
+    tsne_3d = None
+    tsne_perplexity = None
+    try:
+        tsne_2d, tsne_perplexity = _compute_tsne_embedding(coeff_sample, n_components=2, random_state=random_state)
+        if tsne_2d is not None:
+            _plot_embedding_2d(
+                tsne_2d,
+                dominant_sample,
+                output_dir / "tsne_2d_inventor_coefficients.png",
+                selected_k,
+                "Inventor Space in t-SNE 2D (by dominant archetype)",
+                "t-SNE component 1",
+                "t-SNE component 2",
+            )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate t-SNE 2D archetype plot: {exc}")
+
+    try:
+        tsne_3d, tsne_perplexity_3d = _compute_tsne_embedding(coeff_sample, n_components=3, random_state=random_state)
+        if tsne_3d is not None:
+            _plot_embedding_3d(
+                tsne_3d,
+                dominant_sample,
+                output_dir / "tsne_3d_inventor_coefficients.png",
+                selected_k,
+                "Inventor Space in t-SNE 3D (by dominant archetype)",
+                "t-SNE c1",
+                "t-SNE c2",
+                "t-SNE c3",
+            )
+            if tsne_perplexity is None:
+                tsne_perplexity = tsne_perplexity_3d
+    except Exception as exc:
+        print(f"[WARN] Failed to generate t-SNE 3D archetype plot: {exc}")
+
+    pca_2d, pca_2d_evr = _compute_pca_embedding(coeff_sample, n_components=2, random_state=random_state)
+    _plot_embedding_2d(
+        pca_2d,
+        dominant_sample,
+        output_dir / "pca_2d_inventor_coefficients.png",
+        selected_k,
+        "Inventor Space in PCA 2D (by dominant archetype)",
+        "PCA component 1",
+        "PCA component 2",
+    )
+
+    pca_3d, pca_3d_evr = _compute_pca_embedding(coeff_sample, n_components=3, random_state=random_state)
+    _plot_embedding_3d(
+        pca_3d,
+        dominant_sample,
+        output_dir / "pca_3d_inventor_coefficients.png",
+        selected_k,
+        "Inventor Space in PCA 3D (by dominant archetype)",
+        "PCA c1",
+        "PCA c2",
+        "PCA c3",
+    )
+
+    isomap_2d = None
+    isomap_3d = None
+    isomap_n_neighbors = None
+    try:
+        isomap_2d, isomap_n_neighbors = _compute_isomap_embedding(coeff_sample, n_components=2)
+        if isomap_2d is not None:
+            _plot_embedding_2d(
+                isomap_2d,
+                dominant_sample,
+                output_dir / "isomap_2d_inventor_coefficients.png",
+                selected_k,
+                "Inventor Space in Isomap 2D (by dominant archetype)",
+                "Isomap component 1",
+                "Isomap component 2",
+            )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate Isomap 2D archetype plot: {exc}")
+
+    try:
+        isomap_3d, isomap_n_neighbors_3d = _compute_isomap_embedding(coeff_sample, n_components=3)
+        if isomap_3d is not None:
+            _plot_embedding_3d(
+                isomap_3d,
+                dominant_sample,
+                output_dir / "isomap_3d_inventor_coefficients.png",
+                selected_k,
+                "Inventor Space in Isomap 3D (by dominant archetype)",
+                "Isomap c1",
+                "Isomap c2",
+                "Isomap c3",
+            )
+            if isomap_n_neighbors is None:
+                isomap_n_neighbors = isomap_n_neighbors_3d
+    except Exception as exc:
+        print(f"[WARN] Failed to generate Isomap 3D archetype plot: {exc}")
+
+    _plot_archetype_counts(dominant, output_dir / "dominant_archetype_counts.png", selected_k)
+    _plot_archetype_similarity_heatmap(
+        _cosine_similarity_rows(archetypes),
+        output_dir / "archetype_cosine_similarity_heatmap.png",
+    )
+    _save_top_features_csv(
+        archetypes=archetypes,
+        feature_names=feature_names,
+        out_path=output_dir / "archetype_top_features.csv",
+        top_n=25,
+    )
+
+    sampled_inventors = pd.DataFrame(
+        {
+            "inventor": inventor_index[sample_idx].astype(str),
+            "dominant_archetype": dominant_sample,
+            "tsne2_x": tsne_2d[:, 0] if tsne_2d is not None else np.nan,
+            "tsne2_y": tsne_2d[:, 1] if tsne_2d is not None else np.nan,
+            "tsne3_x": tsne_3d[:, 0] if tsne_3d is not None else np.nan,
+            "tsne3_y": tsne_3d[:, 1] if tsne_3d is not None else np.nan,
+            "tsne3_z": tsne_3d[:, 2] if tsne_3d is not None else np.nan,
+            "pca2_x": pca_2d[:, 0],
+            "pca2_y": pca_2d[:, 1],
+            "pca3_x": pca_3d[:, 0],
+            "pca3_y": pca_3d[:, 1],
+            "pca3_z": pca_3d[:, 2],
+            "isomap2_x": isomap_2d[:, 0] if isomap_2d is not None else np.nan,
+            "isomap2_y": isomap_2d[:, 1] if isomap_2d is not None else np.nan,
+            "isomap3_x": isomap_3d[:, 0] if isomap_3d is not None else np.nan,
+            "isomap3_y": isomap_3d[:, 1] if isomap_3d is not None else np.nan,
+            "isomap3_z": isomap_3d[:, 2] if isomap_3d is not None else np.nan,
+        }
+    )
+    sampled_inventors.to_csv(output_dir / "inventor_tsne_coordinates_sampled.csv", index=False)
+
+    analysis_metadata = {
+        **metadata,
+        "output_dir": str(output_dir),
+        "selected_k": int(selected_k),
+        "inventors_total": int(coefficients.shape[0]),
+        "features_total": int(archetypes.shape[1]),
+        "inventors_used_for_embeddings": int(len(sample_idx)),
+        "tsne_perplexity": float(tsne_perplexity) if tsne_perplexity is not None else None,
+        "pca_explained_variance_ratio_2d": pca_2d_evr,
+        "pca_explained_variance_ratio_3d": pca_3d_evr,
+        "isomap_n_neighbors": int(isomap_n_neighbors) if isomap_n_neighbors is not None else None,
+        "random_state": int(random_state),
+        "max_inventors_tsne": int(max_inventors_tsne),
+    }
+    _write_json(output_dir / "analysis_metadata.json", analysis_metadata)
+    return output_dir
+
+
+def _aa_split_joint_embedding(embedding: np.ndarray, n_inventors: int) -> Tuple[np.ndarray, np.ndarray]:
+    return embedding[:n_inventors], embedding[n_inventors:]
+
+
+def _aa_stack_sparse_dense_for_joint_embedding(inventor_sparse: Any, archetypes: np.ndarray) -> Any:
+    return sparse.vstack(
+        [
+            inventor_sparse,
+            sparse.csr_matrix(np.asarray(archetypes, dtype=float)),
+        ],
+        format="csr",
+    )
+
+
+def _aa_plot_membership_simplex(
+    memberships: np.ndarray,
+    out_path: Path,
+    k: int,
+    title: str,
+    max_points: int = 4000,
+    random_state: int = 42,
+) -> None:
+    memberships = np.asarray(memberships, dtype=float)
+    if np.any(memberships < 0):
+        raise ValueError("memberships must be non-negative for simplex plotting")
+
+    row_sums = memberships.sum(axis=1, keepdims=True)
+    safe_row_sums = np.where(row_sums == 0.0, 1.0, row_sums)
+    memberships = memberships / safe_row_sums
+
+    dominant = np.argmax(memberships, axis=1)
+    purity = np.max(memberships, axis=1)
+    n = memberships.shape[0]
+
+    if max_points > 0 and n > max_points:
+        rng = np.random.default_rng(random_state)
+        idx = np.sort(rng.choice(n, size=max_points, replace=False))
+        memberships_plot = memberships[idx]
+        dominant_plot = dominant[idx]
+        purity_plot = purity[idx]
+    else:
+        memberships_plot = memberships
+        dominant_plot = dominant
+        purity_plot = purity
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        cmap = plt.get_cmap("tab20", max(k, 1))
+        point_colors = [cmap(i) for i in dominant_plot]
+        fig, ax = plt.subplots(figsize=(12, 12))
+
+        simplex(
+            memberships_plot,
+            c=point_colors,
+            s=(purity_plot ** 2) * 100.0,
+            alpha=0.6,
+            ax=ax,
+            show_axis=True,
+            show_vertices=False,
+            axis_params={
+                "color": "#4a4a4a",
+                "linewidth": 1.0,
+                "linestyle": "-",
+                "zorder": 0,
+            },
+        )
+
+        theta = np.linspace(0, 2 * np.pi, k, endpoint=False)
+        for i, angle in enumerate(theta):
+            ax.text(
+                1.08 * np.cos(angle),
+                1.08 * np.sin(angle),
+                f"A{i+1}",
+                ha="center",
+                va="center",
+                fontsize=11,
+                fontweight="bold",
+                color=cmap(i),
+                zorder=6,
+            )
+
+        ax.set_title(title, pad=14, fontweight="bold")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
+def _aa_save_membership_simplex_vertices_csv(out_path: Path, k: int) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    theta = np.linspace(0, 2 * np.pi, k, endpoint=False)
+    pd.DataFrame(
+        {
+            "archetype": [f"A{i}" for i in range(1, k + 1)],
+            "x": np.cos(theta),
+            "y": np.sin(theta),
+        }
+    ).to_csv(out_path, index=False)
+
+
+def _aa_fit_umap(matrix: Any, n_components: int, random_state: int) -> np.ndarray:
+    reducer = umap.UMAP(
+        n_components=n_components,
+        n_neighbors=30,
+        min_dist=0.10,
+        metric="cosine",
+        random_state=random_state,
+    )
+    return reducer.fit_transform(matrix)
+
+
+def _aa_safe_svd_components(n_rows: int, n_cols: int, target: int = 100) -> int:
+    return max(2, min(int(target), n_rows - 1, n_cols - 1))
+
+
+def _aa_compute_purity(memberships: np.ndarray) -> np.ndarray:
+    memberships = np.asarray(memberships, dtype=float)
+    row_sums = memberships.sum(axis=1, keepdims=True)
+    safe_row_sums = np.where(row_sums == 0.0, 1.0, row_sums)
+    memberships = memberships / safe_row_sums
+    return np.max(memberships, axis=1)
+
+
+def _aa_purity_stats_dict(values: np.ndarray) -> Dict[str, Any]:
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return {
+            "count": 0,
+            "mean": np.nan,
+            "std": np.nan,
+            "var": np.nan,
+            "min": np.nan,
+            "q01": np.nan,
+            "q05": np.nan,
+            "q10": np.nan,
+            "q25": np.nan,
+            "median": np.nan,
+            "q75": np.nan,
+            "q90": np.nan,
+            "q95": np.nan,
+            "q99": np.nan,
+            "max": np.nan,
+            "iqr": np.nan,
+        }
+
+    q01, q05, q10, q25, q50, q75, q90, q95, q99 = np.quantile(
+        values,
+        [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99],
+    )
+    return {
+        "count": int(values.size),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values, ddof=0)),
+        "var": float(np.var(values, ddof=0)),
+        "min": float(np.min(values)),
+        "q01": float(q01),
+        "q05": float(q05),
+        "q10": float(q10),
+        "q25": float(q25),
+        "median": float(q50),
+        "q75": float(q75),
+        "q90": float(q90),
+        "q95": float(q95),
+        "q99": float(q99),
+        "max": float(np.max(values)),
+        "iqr": float(q75 - q25),
+    }
+
+
+def _aa_save_purity_stats_overall(purity: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([_aa_purity_stats_dict(purity)]).to_csv(out_path, index=False)
+
+
+def _aa_save_purity_stats_by_archetype(
+    purity: np.ndarray,
+    dominant: np.ndarray,
+    k: int,
+    out_path: Path,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for arch_id in range(1, k + 1):
+        stats = _aa_purity_stats_dict(purity[dominant == arch_id])
+        stats["archetype"] = f"A{arch_id}"
+        rows.append(stats)
+
+    cols = [
+        "archetype",
+        "count",
+        "mean",
+        "std",
+        "var",
+        "min",
+        "q01",
+        "q05",
+        "q10",
+        "q25",
+        "median",
+        "q75",
+        "q90",
+        "q95",
+        "q99",
+        "max",
+        "iqr",
+    ]
+    pd.DataFrame(rows)[cols].to_csv(out_path, index=False)
+
+
+def _aa_plot_purity_histogram(
+    purity: np.ndarray,
+    out_path: Path,
+    title: str,
+    bins: int = 30,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(11, 6.5))
+        counts, bin_edges, _ = ax.hist(
+            purity,
+            bins=bins,
+            range=(0.0, 1.0),
+            color="#457b9d",
+            edgecolor="#ffffff",
+            linewidth=0.9,
+        )
+
+        ax.set_title(title, pad=12, fontweight="bold")
+        ax.set_xlabel("Purity (max membership)")
+        ax.set_ylabel("Inventor count")
+        ax.grid(axis="y", alpha=0.25)
+
+        mean_val = float(np.mean(purity)) if len(purity) > 0 else np.nan
+        median_val = float(np.median(purity)) if len(purity) > 0 else np.nan
+        if np.isfinite(mean_val):
+            ax.axvline(mean_val, color="#d62828", linestyle="--", linewidth=1.6, label=f"Mean = {mean_val:.3f}")
+        if np.isfinite(median_val):
+            ax.axvline(median_val, color="#2a9d8f", linestyle=":", linewidth=1.8, label=f"Median = {median_val:.3f}")
+
+        if len(counts) > 0 and max(counts) > 0:
+            for c, left, right in zip(counts, bin_edges[:-1], bin_edges[1:]):
+                if c > 0:
+                    ax.text((left + right) / 2.0, c, f"{int(c)}", ha="center", va="bottom", fontsize=9)
+
+        ax.set_xlim(0.0, 1.0)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(loc="best", frameon=True, facecolor="#ffffff", edgecolor="#dbe3ee")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
+def _aa_plot_purity_histogram_by_archetype(
+    purity: np.ndarray,
+    dominant: np.ndarray,
+    k: int,
+    out_dir: Path,
+    bins: int = 20,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        cmap = plt.get_cmap("tab20", max(k, 1))
+        for arch_id in range(1, k + 1):
+            vals = purity[dominant == arch_id]
+            fig, ax = plt.subplots(figsize=(11, 6.5))
+            counts, bin_edges, _ = ax.hist(
+                vals,
+                bins=bins,
+                range=(0.0, 1.0),
+                color=cmap(arch_id - 1),
+                edgecolor="#ffffff",
+                linewidth=0.9,
+            )
+
+            if len(vals) > 0:
+                mean_val = float(np.mean(vals))
+                median_val = float(np.median(vals))
+                ax.axvline(mean_val, color="#d62828", linestyle="--", linewidth=1.6, label=f"Mean = {mean_val:.3f}")
+                ax.axvline(median_val, color="#2a9d8f", linestyle=":", linewidth=1.8, label=f"Median = {median_val:.3f}")
+
+            ax.set_title(f"Purity Histogram for Dominant Archetype A{arch_id}", pad=12, fontweight="bold")
+            ax.set_xlabel("Purity (max membership)")
+            ax.set_ylabel("Inventor count")
+            ax.grid(axis="y", alpha=0.25)
+
+            for c, left, right in zip(counts, bin_edges[:-1], bin_edges[1:]):
+                if c > 0:
+                    ax.text((left + right) / 2.0, c, f"{int(c)}", ha="center", va="bottom", fontsize=9)
+
+            ax.set_xlim(0.0, 1.0)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.legend(loc="best", frameon=True, facecolor="#ffffff", edgecolor="#dbe3ee")
+            fig.tight_layout()
+            fig.savefig(out_dir / f"purity_histogram_A{arch_id}.png", dpi=180)
+            plt.close(fig)
+
+
+def _aa_plot_embedding_2d(
+    inventor_embedding: np.ndarray,
+    archetype_embedding: np.ndarray,
+    dominant: np.ndarray,
+    out_path: Path,
+    k: int,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        cmap = plt.get_cmap("tab20", max(k, 1))
+        fig, ax = plt.subplots(figsize=(12, 9))
+        for arch_id in range(1, k + 1):
+            mask = dominant == arch_id
+            if np.any(mask):
+                ax.scatter(
+                    inventor_embedding[mask, 0],
+                    inventor_embedding[mask, 1],
+                    s=14,
+                    alpha=0.58,
+                    color=cmap(arch_id - 1),
+                    label=f"A{arch_id}",
+                )
+
+            arch_point = archetype_embedding[arch_id - 1]
+            ax.scatter(
+                arch_point[0],
+                arch_point[1],
+                marker="X",
+                s=180,
+                color=cmap(arch_id - 1),
+                edgecolor="black",
+                linewidth=0.8,
+                alpha=0.8,
+                zorder=5,
+            )
+            ax.text(
+                arch_point[0],
+                arch_point[1],
+                f"A{arch_id}",
+                fontsize=10,
+                fontweight="bold",
+                va="bottom",
+                ha="left",
+            )
+
+        ax.set_title(title, pad=12, fontweight="bold")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.25)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(loc="best", ncols=2, frameon=True, facecolor="#ffffff", edgecolor="#dbe3ee")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
+def _aa_plot_embedding_3d(
+    inventor_embedding: np.ndarray,
+    archetype_embedding: np.ndarray,
+    dominant: np.ndarray,
+    out_path: Path,
+    k: int,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    zlabel: str,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(_ARCHETYPE_PLOT_STYLE):
+        cmap = plt.get_cmap("tab20", max(k, 1))
+        fig = plt.figure(figsize=(13, 10))
+        ax = fig.add_subplot(111, projection="3d")
+        for arch_id in range(1, k + 1):
+            mask = dominant == arch_id
+            if np.any(mask):
+                ax.scatter(
+                    inventor_embedding[mask, 0],
+                    inventor_embedding[mask, 1],
+                    inventor_embedding[mask, 2],
+                    s=10,
+                    alpha=0.45,
+                    color=cmap(arch_id - 1),
+                    label=f"A{arch_id}",
+                )
+
+            arch_point = archetype_embedding[arch_id - 1]
+            ax.scatter(
+                arch_point[0],
+                arch_point[1],
+                arch_point[2],
+                marker="X",
+                s=220,
+                alpha=0.8,
+                color=cmap(arch_id - 1),
+                edgecolor="black",
+                linewidth=0.8,
+                depthshade=False,
+            )
+
+        ax.set_title(title, pad=12, fontweight="bold")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_zlabel(zlabel)
+        ax.legend(loc="upper left", ncols=2, frameon=True, facecolor="#ffffff", edgecolor="#dbe3ee")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=180)
+        plt.close(fig)
+
+
+def _aa_embedding_column(embedding: Optional[np.ndarray], axis: int, length: int) -> np.ndarray:
+    if embedding is None:
+        return np.full(length, np.nan)
+    return embedding[:, axis]
+
+
+def _run_archetype_optical_analysis_current(
+    *,
+    inventor_skill_df: pd.DataFrame,
+    memberships_df: pd.DataFrame,
+    archetypes: np.ndarray,
+    inventor_index: pd.Index,
+    feature_names: List[str],
+    selected_k: int,
+    output_dir: Path,
+    random_state: int,
+    max_inventors_tsne: int,
+    metadata: Dict[str, Any],
+) -> Path:
+    memberships = memberships_df.to_numpy(dtype=float, copy=False)
+    if memberships.ndim != 2 or archetypes.ndim != 2:
+        raise ValueError("Expected 2D membership and archetype matrices for optical analysis.")
+    if memberships.shape[0] != len(inventor_index):
+        raise ValueError(
+            "Mismatch between membership rows and inventor index rows: "
+            f"{memberships.shape[0]} vs {len(inventor_index)}"
+        )
+    if inventor_skill_df.shape[0] != len(inventor_index):
+        raise ValueError(
+            "Mismatch between inventor skill rows and inventor index rows: "
+            f"{inventor_skill_df.shape[0]} vs {len(inventor_index)}"
+        )
+    if archetypes.shape[1] != len(feature_names):
+        raise ValueError(
+            "Mismatch between archetype features and inventor skill columns: "
+            f"{archetypes.shape[1]} vs {len(feature_names)}"
+        )
+    if inventor_skill_df.shape[1] != len(feature_names):
+        raise ValueError(
+            "Mismatch between inventor skill columns and feature names: "
+            f"{inventor_skill_df.shape[1]} vs {len(feature_names)}"
+        )
+    if memberships.shape[1] != selected_k:
+        raise ValueError(
+            "Mismatch between membership columns and selected_k: "
+            f"{memberships.shape[1]} vs {selected_k}"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    inventor_input = sparse.csr_matrix(inventor_skill_df.to_numpy(dtype=float, copy=False))
+    dominant = np.argmax(memberships, axis=1) + 1
+    sample_idx = _sample_indices_by_group(dominant, max_inventors_tsne, random_state)
+    dominant_sample = dominant[sample_idx]
+    purity = _aa_compute_purity(memberships)
+    input_sample = inventor_input[sample_idx]
+    joint_matrix = np.vstack([input_sample.toarray(), archetypes])
+    joint_sparse = _aa_stack_sparse_dense_for_joint_embedding(input_sample, archetypes)
+    n_sample = input_sample.shape[0]
+    n_joint = joint_matrix.shape[0]
+
+    perplexity = min(35, max(5, n_joint // 40))
+    if perplexity >= n_joint:
+        perplexity = max(1, n_joint - 1)
+    n_neighbors = min(15, max(2, n_joint - 1))
+
+    _aa_plot_purity_histogram(
+        purity=purity,
+        out_path=_aa_with_k_suffix(output_dir / "purity_histogram_overall.png", selected_k),
+        title="Purity Histogram (all inventors)",
+        bins=30,
+    )
+    _aa_plot_purity_histogram_by_archetype(
+        purity=purity,
+        dominant=dominant,
+        k=selected_k,
+        out_dir=_aa_with_k_suffix(output_dir / "purity_histograms_by_archetype.png", selected_k),
+        bins=20,
+    )
+    _aa_save_purity_stats_overall(
+        purity=purity,
+        out_path=_aa_with_k_suffix(output_dir / "purity_stats_overall.csv", selected_k),
+    )
+    _aa_save_purity_stats_by_archetype(
+        purity=purity,
+        dominant=dominant,
+        k=selected_k,
+        out_path=_aa_with_k_suffix(output_dir / "purity_stats_by_archetype.csv", selected_k),
+    )
+    try:
+        _aa_plot_membership_simplex(
+            memberships=memberships,
+            out_path=_aa_with_k_suffix(output_dir / "membership_simplex_plot.png", selected_k),
+            k=selected_k,
+            title="Simplex: Colored by Dominant Archetype",
+            max_points=4000,
+            random_state=random_state,
+        )
+        _aa_save_membership_simplex_vertices_csv(
+            _aa_with_k_suffix(output_dir / "membership_simplex_vertices.csv", selected_k),
+            selected_k,
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate membership simplex outputs: {exc}")
+
+    emb2 = None
+    emb2_arch = None
+    emb3 = None
+    emb3_arch = None
+    emb_pca2 = None
+    emb_pca2_arch = None
+    emb_pca3 = None
+    emb_pca3_arch = None
+    emb_iso2 = None
+    emb_iso2_arch = None
+    emb_iso3 = None
+    emb_iso3_arch = None
+    emb_umap_raw_2d = None
+    emb_umap_raw_arch_2d = None
+    emb_umap_raw_3d = None
+    emb_umap_raw_arch_3d = None
+    emb_umap_svd_2d = None
+    emb_umap_svd_arch_2d = None
+    emb_umap_svd_3d = None
+    emb_umap_svd_arch_3d = None
+    emb_svd_tsne_2d = None
+    emb_svd_tsne_arch_2d = None
+    emb_svd_tsne_3d = None
+    emb_svd_tsne_arch_3d = None
+    pca_2d_evr = None
+    pca_3d_evr = None
+    svd_n_components = None
+    svd_explained_variance_ratio_sum = None
+
+    try:
+        emb2_all = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            learning_rate="auto",
+            init="pca",
+            random_state=random_state,
+        ).fit_transform(joint_matrix)
+        emb2, emb2_arch = _aa_split_joint_embedding(emb2_all, n_sample)
+        _aa_plot_embedding_2d(
+            emb2,
+            emb2_arch,
+            dominant_sample,
+            _aa_with_k_suffix(output_dir / "tsne_2d_inventor_skills.png", selected_k),
+            selected_k,
+            "Inventor Skill Input Space in t-SNE 2D (colored by dominant archetype)",
+            "t-SNE component 1",
+            "t-SNE component 2",
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate archetype t-SNE 2D plot: {exc}")
+
+    try:
+        emb3_all = TSNE(
+            n_components=3,
+            perplexity=perplexity,
+            learning_rate="auto",
+            init="pca",
+            random_state=random_state,
+        ).fit_transform(joint_matrix)
+        emb3, emb3_arch = _aa_split_joint_embedding(emb3_all, n_sample)
+        _aa_plot_embedding_3d(
+            emb3,
+            emb3_arch,
+            dominant_sample,
+            _aa_with_k_suffix(output_dir / "tsne_3d_inventor_skills.png", selected_k),
+            selected_k,
+            "Inventor Skill Input Space in t-SNE 3D (colored by dominant archetype)",
+            "t-SNE c1",
+            "t-SNE c2",
+            "t-SNE c3",
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate archetype t-SNE 3D plot: {exc}")
+
+    try:
+        pca_2d = PCA(n_components=2, random_state=random_state)
+        emb_pca2_all = pca_2d.fit_transform(joint_matrix)
+        emb_pca2, emb_pca2_arch = _aa_split_joint_embedding(emb_pca2_all, n_sample)
+        pca_2d_evr = [float(v) for v in pca_2d.explained_variance_ratio_]
+        _aa_plot_embedding_2d(
+            emb_pca2,
+            emb_pca2_arch,
+            dominant_sample,
+            _aa_with_k_suffix(output_dir / "pca_2d_inventor_skills.png", selected_k),
+            selected_k,
+            "Inventor Skill Input Space in PCA 2D (colored by dominant archetype)",
+            "PCA component 1",
+            "PCA component 2",
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate archetype PCA 2D plot: {exc}")
+
+    try:
+        pca_3d = PCA(n_components=3, random_state=random_state)
+        emb_pca3_all = pca_3d.fit_transform(joint_matrix)
+        emb_pca3, emb_pca3_arch = _aa_split_joint_embedding(emb_pca3_all, n_sample)
+        pca_3d_evr = [float(v) for v in pca_3d.explained_variance_ratio_]
+        _aa_plot_embedding_3d(
+            emb_pca3,
+            emb_pca3_arch,
+            dominant_sample,
+            _aa_with_k_suffix(output_dir / "pca_3d_inventor_skills.png", selected_k),
+            selected_k,
+            "Inventor Skill Input Space in PCA 3D (colored by dominant archetype)",
+            "PCA c1",
+            "PCA c2",
+            "PCA c3",
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate archetype PCA 3D plot: {exc}")
+
+    try:
+        emb_iso2_all = Isomap(n_components=2, n_neighbors=n_neighbors).fit_transform(joint_matrix)
+        emb_iso2, emb_iso2_arch = _aa_split_joint_embedding(emb_iso2_all, n_sample)
+        _aa_plot_embedding_2d(
+            emb_iso2,
+            emb_iso2_arch,
+            dominant_sample,
+            _aa_with_k_suffix(output_dir / "isomap_2d_inventor_skills.png", selected_k),
+            selected_k,
+            "Inventor Skill Input Space in Isomap 2D (colored by dominant archetype)",
+            "Isomap component 1",
+            "Isomap component 2",
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate archetype Isomap 2D plot: {exc}")
+
+    try:
+        emb_iso3_all = Isomap(n_components=3, n_neighbors=n_neighbors).fit_transform(joint_matrix)
+        emb_iso3, emb_iso3_arch = _aa_split_joint_embedding(emb_iso3_all, n_sample)
+        _aa_plot_embedding_3d(
+            emb_iso3,
+            emb_iso3_arch,
+            dominant_sample,
+            _aa_with_k_suffix(output_dir / "isomap_3d_inventor_skills.png", selected_k),
+            selected_k,
+            "Inventor Skill Input Space in Isomap 3D (colored by dominant archetype)",
+            "Isomap c1",
+            "Isomap c2",
+            "Isomap c3",
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate archetype Isomap 3D plot: {exc}")
+
+    try:
+        emb_umap_raw_all_2d = _aa_fit_umap(joint_sparse, n_components=2, random_state=random_state)
+        emb_umap_raw_2d, emb_umap_raw_arch_2d = _aa_split_joint_embedding(emb_umap_raw_all_2d, n_sample)
+        _aa_plot_embedding_2d(
+            emb_umap_raw_2d,
+            emb_umap_raw_arch_2d,
+            dominant_sample,
+            _aa_with_k_suffix(output_dir / "umap_2d_raw_input.png", selected_k),
+            selected_k,
+            "Inventor Skill Input Space in UMAP 2D (raw sparse TF-IDF, colored by dominant archetype)",
+            "UMAP component 1",
+            "UMAP component 2",
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate raw-input UMAP 2D plot: {exc}")
+
+    try:
+        emb_umap_raw_all_3d = _aa_fit_umap(joint_sparse, n_components=3, random_state=random_state)
+        emb_umap_raw_3d, emb_umap_raw_arch_3d = _aa_split_joint_embedding(emb_umap_raw_all_3d, n_sample)
+        _aa_plot_embedding_3d(
+            emb_umap_raw_3d,
+            emb_umap_raw_arch_3d,
+            dominant_sample,
+            _aa_with_k_suffix(output_dir / "umap_3d_raw_input.png", selected_k),
+            selected_k,
+            "Inventor Skill Input Space in UMAP 3D (raw sparse TF-IDF, colored by dominant archetype)",
+            "UMAP c1",
+            "UMAP c2",
+            "UMAP c3",
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate raw-input UMAP 3D plot: {exc}")
+
+    joint_svd = None
+    perplexity_svd_tsne = None
+    try:
+        svd_n_components = _aa_safe_svd_components(n_rows=n_joint, n_cols=joint_sparse.shape[1], target=100)
+        svd_100 = TruncatedSVD(n_components=svd_n_components, random_state=random_state)
+        joint_svd = svd_100.fit_transform(joint_sparse)
+        svd_explained_variance_ratio_sum = float(np.sum(svd_100.explained_variance_ratio_))
+    except Exception as exc:
+        print(f"[WARN] Failed to compute SVD embedding basis: {exc}")
+
+    if joint_svd is not None:
+        try:
+            emb_umap_svd_all_2d = _aa_fit_umap(joint_svd, n_components=2, random_state=random_state)
+            emb_umap_svd_2d, emb_umap_svd_arch_2d = _aa_split_joint_embedding(emb_umap_svd_all_2d, n_sample)
+            _aa_plot_embedding_2d(
+                emb_umap_svd_2d,
+                emb_umap_svd_arch_2d,
+                dominant_sample,
+                _aa_with_k_suffix(output_dir / "svd100_umap_2d_input.png", selected_k),
+                selected_k,
+                f"Inventor Skill Input Space in SVD({svd_n_components}) + UMAP 2D (colored by dominant archetype)",
+                "UMAP component 1",
+                "UMAP component 2",
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to generate SVD+UMAP 2D plot: {exc}")
+
+        try:
+            emb_umap_svd_all_3d = _aa_fit_umap(joint_svd, n_components=3, random_state=random_state)
+            emb_umap_svd_3d, emb_umap_svd_arch_3d = _aa_split_joint_embedding(emb_umap_svd_all_3d, n_sample)
+            _aa_plot_embedding_3d(
+                emb_umap_svd_3d,
+                emb_umap_svd_arch_3d,
+                dominant_sample,
+                _aa_with_k_suffix(output_dir / "svd100_umap_3d_input.png", selected_k),
+                selected_k,
+                f"Inventor Skill Input Space in SVD({svd_n_components}) + UMAP 3D (colored by dominant archetype)",
+                "UMAP c1",
+                "UMAP c2",
+                "UMAP c3",
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to generate SVD+UMAP 3D plot: {exc}")
+
+        perplexity_svd_tsne = min(35, max(5, n_joint // 40))
+        if perplexity_svd_tsne >= n_joint:
+            perplexity_svd_tsne = max(1, n_joint - 1)
+
+        try:
+            emb_svd_tsne_all_2d = TSNE(
+                n_components=2,
+                perplexity=perplexity_svd_tsne,
+                learning_rate="auto",
+                init="pca",
+                random_state=random_state,
+            ).fit_transform(joint_svd)
+            emb_svd_tsne_2d, emb_svd_tsne_arch_2d = _aa_split_joint_embedding(emb_svd_tsne_all_2d, n_sample)
+            _aa_plot_embedding_2d(
+                emb_svd_tsne_2d,
+                emb_svd_tsne_arch_2d,
+                dominant_sample,
+                _aa_with_k_suffix(output_dir / "svd100_tsne_2d_input.png", selected_k),
+                selected_k,
+                f"Inventor Skill Input Space in SVD({svd_n_components}) + t-SNE 2D (colored by dominant archetype)",
+                "t-SNE component 1",
+                "t-SNE component 2",
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to generate SVD+t-SNE 2D plot: {exc}")
+
+        try:
+            emb_svd_tsne_all_3d = TSNE(
+                n_components=3,
+                perplexity=perplexity_svd_tsne,
+                learning_rate="auto",
+                init="pca",
+                random_state=random_state,
+            ).fit_transform(joint_svd)
+            emb_svd_tsne_3d, emb_svd_tsne_arch_3d = _aa_split_joint_embedding(emb_svd_tsne_all_3d, n_sample)
+            _aa_plot_embedding_3d(
+                emb_svd_tsne_3d,
+                emb_svd_tsne_arch_3d,
+                dominant_sample,
+                _aa_with_k_suffix(output_dir / "svd100_tsne_3d_input.png", selected_k),
+                selected_k,
+                f"Inventor Skill Input Space in SVD({svd_n_components}) + t-SNE 3D (colored by dominant archetype)",
+                "t-SNE c1",
+                "t-SNE c2",
+                "t-SNE c3",
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to generate SVD+t-SNE 3D plot: {exc}")
+
+    try:
+        _plot_archetype_counts(
+            dominant,
+            _aa_with_k_suffix(output_dir / "dominant_archetype_counts.png", selected_k),
+            selected_k,
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate dominant archetype counts plot: {exc}")
+
+    try:
+        _plot_archetype_similarity_heatmap(
+            _cosine_similarity_rows(archetypes),
+            _aa_with_k_suffix(output_dir / "archetype_cosine_similarity_heatmap.png", selected_k),
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to generate archetype similarity heatmap: {exc}")
+
+    try:
+        _save_top_features_csv(
+            archetypes=archetypes,
+            feature_names=feature_names,
+            out_path=_aa_with_k_suffix(output_dir / "archetype_top_features.csv", selected_k),
+            top_n=25,
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to export archetype top features: {exc}")
+
+    run_dir = metadata.get("run_dir")
+    embedding_input_file = str(Path(run_dir) / "inventor_skill_matrix.csv.gz") if run_dir else None
+    dominant_coloring_file = str(Path(run_dir) / "memberships.csv.gz") if run_dir else None
+
+    _write_json(
+        _aa_with_k_suffix(output_dir / "analysis_metadata.json", selected_k),
+        {
+            **metadata,
+            "output_dir": str(output_dir),
+            "selected_k": int(selected_k),
+            "inventors_total": int(memberships.shape[0]),
+            "features_total": int(archetypes.shape[1]),
+            "inventors_used_for_embedding": int(n_sample),
+            "joint_embedding_points": int(n_joint),
+            "embedding_input_file": embedding_input_file,
+            "embedding_basis": "run-specific inventor input matrix",
+            "dominant_coloring_file": dominant_coloring_file,
+            "dominant_coloring_basis": "AA memberships argmax (equivalent to normalized coefficients argmax)",
+            "archetype_marker_basis": "AA archetype vectors jointly embedded with inventor inputs",
+            "tsne_perplexity": float(perplexity),
+            "pca_explained_variance_ratio_2d": pca_2d_evr,
+            "pca_explained_variance_ratio_3d": pca_3d_evr,
+            "isomap_n_neighbors": int(n_neighbors),
+            "umap_metric": "cosine",
+            "umap_n_neighbors": 30,
+            "umap_min_dist": 0.10,
+            "svd_n_components_for_sparse_plots": int(svd_n_components) if svd_n_components is not None else None,
+            "svd_explained_variance_ratio_sum": svd_explained_variance_ratio_sum,
+            "random_state": int(random_state),
+            "membership_simplex_basis": "AA memberships projected with archetypes.visualization.simplex.simplex",
+            "purity_definition": "max normalized AA membership per inventor",
+            "purity_stats_files": {
+                "overall": str(_aa_with_k_suffix(output_dir / "purity_stats_overall.csv", selected_k)),
+                "by_archetype": str(_aa_with_k_suffix(output_dir / "purity_stats_by_archetype.csv", selected_k)),
+            },
+            "max_inventors_tsne": int(max_inventors_tsne),
+        },
+    )
+
+    pd.DataFrame(
+        {
+            "inventor": inventor_index[sample_idx].astype(str),
+            "dominant_archetype": dominant_sample,
+            "tsne2_x": _aa_embedding_column(emb2, 0, n_sample),
+            "tsne2_y": _aa_embedding_column(emb2, 1, n_sample),
+            "tsne3_x": _aa_embedding_column(emb3, 0, n_sample),
+            "tsne3_y": _aa_embedding_column(emb3, 1, n_sample),
+            "tsne3_z": _aa_embedding_column(emb3, 2, n_sample),
+            "pca2_x": _aa_embedding_column(emb_pca2, 0, n_sample),
+            "pca2_y": _aa_embedding_column(emb_pca2, 1, n_sample),
+            "pca3_x": _aa_embedding_column(emb_pca3, 0, n_sample),
+            "pca3_y": _aa_embedding_column(emb_pca3, 1, n_sample),
+            "pca3_z": _aa_embedding_column(emb_pca3, 2, n_sample),
+            "isomap2_x": _aa_embedding_column(emb_iso2, 0, n_sample),
+            "isomap2_y": _aa_embedding_column(emb_iso2, 1, n_sample),
+            "isomap3_x": _aa_embedding_column(emb_iso3, 0, n_sample),
+            "isomap3_y": _aa_embedding_column(emb_iso3, 1, n_sample),
+            "isomap3_z": _aa_embedding_column(emb_iso3, 2, n_sample),
+            "umap_raw_2d_x": _aa_embedding_column(emb_umap_raw_2d, 0, n_sample),
+            "umap_raw_2d_y": _aa_embedding_column(emb_umap_raw_2d, 1, n_sample),
+            "umap_raw_3d_x": _aa_embedding_column(emb_umap_raw_3d, 0, n_sample),
+            "umap_raw_3d_y": _aa_embedding_column(emb_umap_raw_3d, 1, n_sample),
+            "umap_raw_3d_z": _aa_embedding_column(emb_umap_raw_3d, 2, n_sample),
+            "svd_umap_2d_x": _aa_embedding_column(emb_umap_svd_2d, 0, n_sample),
+            "svd_umap_2d_y": _aa_embedding_column(emb_umap_svd_2d, 1, n_sample),
+            "svd_umap_3d_x": _aa_embedding_column(emb_umap_svd_3d, 0, n_sample),
+            "svd_umap_3d_y": _aa_embedding_column(emb_umap_svd_3d, 1, n_sample),
+            "svd_umap_3d_z": _aa_embedding_column(emb_umap_svd_3d, 2, n_sample),
+            "svd_tsne_2d_x": _aa_embedding_column(emb_svd_tsne_2d, 0, n_sample),
+            "svd_tsne_2d_y": _aa_embedding_column(emb_svd_tsne_2d, 1, n_sample),
+            "svd_tsne_3d_x": _aa_embedding_column(emb_svd_tsne_3d, 0, n_sample),
+            "svd_tsne_3d_y": _aa_embedding_column(emb_svd_tsne_3d, 1, n_sample),
+            "svd_tsne_3d_z": _aa_embedding_column(emb_svd_tsne_3d, 2, n_sample),
+        }
+    ).to_csv(
+        _aa_with_k_suffix(output_dir / "inventor_embedding_coordinates_sampled.csv", selected_k),
+        index=False,
+    )
+
+    pd.DataFrame(
+        {
+            "archetype": [f"A{i}" for i in range(1, selected_k + 1)],
+            "tsne2_x": _aa_embedding_column(emb2_arch, 0, selected_k),
+            "tsne2_y": _aa_embedding_column(emb2_arch, 1, selected_k),
+            "tsne3_x": _aa_embedding_column(emb3_arch, 0, selected_k),
+            "tsne3_y": _aa_embedding_column(emb3_arch, 1, selected_k),
+            "tsne3_z": _aa_embedding_column(emb3_arch, 2, selected_k),
+            "pca2_x": _aa_embedding_column(emb_pca2_arch, 0, selected_k),
+            "pca2_y": _aa_embedding_column(emb_pca2_arch, 1, selected_k),
+            "pca3_x": _aa_embedding_column(emb_pca3_arch, 0, selected_k),
+            "pca3_y": _aa_embedding_column(emb_pca3_arch, 1, selected_k),
+            "pca3_z": _aa_embedding_column(emb_pca3_arch, 2, selected_k),
+            "isomap2_x": _aa_embedding_column(emb_iso2_arch, 0, selected_k),
+            "isomap2_y": _aa_embedding_column(emb_iso2_arch, 1, selected_k),
+            "isomap3_x": _aa_embedding_column(emb_iso3_arch, 0, selected_k),
+            "isomap3_y": _aa_embedding_column(emb_iso3_arch, 1, selected_k),
+            "isomap3_z": _aa_embedding_column(emb_iso3_arch, 2, selected_k),
+            "umap_raw_2d_x": _aa_embedding_column(emb_umap_raw_arch_2d, 0, selected_k),
+            "umap_raw_2d_y": _aa_embedding_column(emb_umap_raw_arch_2d, 1, selected_k),
+            "umap_raw_3d_x": _aa_embedding_column(emb_umap_raw_arch_3d, 0, selected_k),
+            "umap_raw_3d_y": _aa_embedding_column(emb_umap_raw_arch_3d, 1, selected_k),
+            "umap_raw_3d_z": _aa_embedding_column(emb_umap_raw_arch_3d, 2, selected_k),
+            "svd_umap_2d_x": _aa_embedding_column(emb_umap_svd_arch_2d, 0, selected_k),
+            "svd_umap_2d_y": _aa_embedding_column(emb_umap_svd_arch_2d, 1, selected_k),
+            "svd_umap_3d_x": _aa_embedding_column(emb_umap_svd_arch_3d, 0, selected_k),
+            "svd_umap_3d_y": _aa_embedding_column(emb_umap_svd_arch_3d, 1, selected_k),
+            "svd_umap_3d_z": _aa_embedding_column(emb_umap_svd_arch_3d, 2, selected_k),
+            "svd_tsne_2d_x": _aa_embedding_column(emb_svd_tsne_arch_2d, 0, selected_k),
+            "svd_tsne_2d_y": _aa_embedding_column(emb_svd_tsne_arch_2d, 1, selected_k),
+            "svd_tsne_3d_x": _aa_embedding_column(emb_svd_tsne_arch_3d, 0, selected_k),
+            "svd_tsne_3d_y": _aa_embedding_column(emb_svd_tsne_arch_3d, 1, selected_k),
+            "svd_tsne_3d_z": _aa_embedding_column(emb_svd_tsne_arch_3d, 2, selected_k),
+        }
+    ).to_csv(
+        _aa_with_k_suffix(output_dir / "archetype_embedding_coordinates.csv", selected_k),
+        index=False,
+    )
+
+    return output_dir
+
+
+def _run_archetype_interpretation(
+    *,
+    archetypes: np.ndarray,
+    feature_names: List[str],
+    selected_k: int,
+    output_dir: Path,
+    metadata: Dict[str, Any],
+    top_n: int = 10,
+) -> Path:
+    if archetypes.ndim != 2:
+        raise ValueError("Expected 2D archetype matrix for interpretation outputs.")
+    if archetypes.shape[1] != len(feature_names):
+        raise ValueError(
+            "Mismatch between archetype features and inventor skill columns: "
+            f"{archetypes.shape[1]} vs {len(feature_names)}"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    arch_df = pd.DataFrame(
+        archetypes,
+        columns=feature_names,
+        index=[f"Archetype_{i+1}" for i in range(archetypes.shape[0])],
+    )
+    arch_df.to_csv(output_dir / f"archetype_k{selected_k}_matrix.csv.gz", compression="gzip")
+
+    mean_feature_scores = arch_df.mean(axis=0)
+    rows = []
+    for archetype_name in arch_df.index:
+        scores = arch_df.loc[archetype_name]
+
+        top_values = scores.sort_values(ascending=False).head(top_n)
+        for rank, (feature, value) in enumerate(top_values.items(), start=1):
+            rows.append(
+                {
+                    "archetype": archetype_name,
+                    "rank": rank,
+                    "feature": feature,
+                    "score": float(value),
+                    "kind": "top_value",
+                }
+            )
+
+        top_delta_vs_mean = (scores - mean_feature_scores).sort_values(ascending=False).head(top_n)
+        for rank, (feature, value) in enumerate(top_delta_vs_mean.items(), start=1):
+            rows.append(
+                {
+                    "archetype": archetype_name,
+                    "rank": rank,
+                    "feature": feature,
+                    "score": float(value),
+                    "kind": "top_delta_vs_mean",
+                }
+            )
+
+        competing_archetypes = arch_df.drop(index=archetype_name)
+        if competing_archetypes.empty:
+            second_best = pd.Series(0.0, index=arch_df.columns)
+        else:
+            second_best = competing_archetypes.max(axis=0)
+        top_gap_vs_second_best = (scores - second_best).sort_values(ascending=False).head(top_n)
+        for rank, (feature, value) in enumerate(top_gap_vs_second_best.items(), start=1):
+            rows.append(
+                {
+                    "archetype": archetype_name,
+                    "rank": rank,
+                    "feature": feature,
+                    "score": float(value),
+                    "kind": "top_gap_vs_2nd_best",
+                }
+            )
+
+    pd.DataFrame(rows).to_csv(output_dir / f"archetype_k{selected_k}_top_features_and_deltas.csv", index=False)
+
+    draft_rows = []
+    for archetype_name in arch_df.index:
+        top_feature = arch_df.loc[archetype_name].sort_values(ascending=False).index[0]
+        draft_rows.append(
+            {
+                "archetype": archetype_name,
+                "top_feature": top_feature,
+                "draft_category": _draft_archetype_category(top_feature),
+            }
+        )
+    pd.DataFrame(draft_rows).to_csv(output_dir / f"archetype_k{selected_k}_draft_categories.csv", index=False)
+
+    _write_json(
+        output_dir / "interpretation_metadata.json",
+        {
+            **metadata,
+            "output_dir": str(output_dir),
+            "selected_k": int(selected_k),
+            "top_n": int(top_n),
+            "n_features": int(len(feature_names)),
+            "n_archetypes": int(archetypes.shape[0]),
+        },
+    )
+    return output_dir
 
 
 def _coefficients_to_memberships_df(coefficients: np.ndarray, index: pd.Index) -> pd.DataFrame:
@@ -258,9 +1813,10 @@ def build_inventor_skill_df(
     ----------
     data : list of dict
         Patent records (already enriched with 'skill_labels': [(label, score), ...]).
-    mode : {"soft","hard","tfidf"}
+    mode : {"soft","hard","binary-hard","tfidf","tf-idf"}
         - "soft": average similarity score per (inventor, skill)
         - "hard": count presence per patent (0/1 within a patent) and sum per inventor
+        - "binary-hard": binary skill presence per inventor from the "hard" count matrix
         - "tfidf": TF-IDF transform of the "hard" count matrix
     inventor_field : str
         Field containing ';;'-separated inventor names.
@@ -277,10 +1833,15 @@ def build_inventor_skill_df(
         Rows = inventors, Columns = skills.
         - "soft": float (avg scores, 0.0 if absent)
         - "hard": int counts (sum of per-patent presence)
+        - "binary-hard": int binary indicators (1 if inventor has the skill at least once)
         - "tfidf": float TF-IDF weights
     """
-    if mode not in {"soft", "hard", "tfidf"}:
-        raise ValueError('mode must be one of: "soft", "hard", "tfidf"')
+    mode = str(mode).strip().lower()
+    match mode:
+        case "soft" | "hard" | "binary-hard" | "tfidf" | "tf-idf":
+            mode = "tfidf" if mode == "tf-idf" else mode
+        case _:
+            raise ValueError('mode must be one of: "soft", "hard", "binary-hard", "tfidf", "tf-idf"')
 
     # collect inventors + skills per patent
     # normalize inventors; optionally skip patents with no skills
@@ -295,7 +1856,7 @@ def build_inventor_skill_df(
                 continue
             yield from ((inv, skills) for inv in inventors)
 
-    if mode in {"hard", "tfidf"}:
+    if mode in {"hard", "binary-hard", "tfidf"}:
         counts = defaultdict(lambda: defaultdict(int))  # inventor -> skill -> count
         all_skills = set()
 
@@ -316,18 +1877,20 @@ def build_inventor_skill_df(
         rows = [[counts[inv].get(sk, 0) for sk in skill_list] for inv in inventor_list]
         df_count = pd.DataFrame(rows, index=inventor_list, columns=skill_list).astype(int)
 
-        if mode == "hard":
-            return df_count
-
-        # mode == "tfidf"
-        try:
-            from sklearn.feature_extraction.text import TfidfTransformer
-            tfidf = TfidfTransformer(norm='l2', use_idf=True, smooth_idf=True, sublinear_tf=False)
-            values = tfidf.fit_transform(df_count.values).toarray()
-            df_tfidf = pd.DataFrame(values, index=df_count.index, columns=df_count.columns)
-            return df_tfidf
-        except Exception as e:
-            raise RuntimeError(f"Failed to compute TF-IDF: {e}")
+        match mode:
+            case "hard":
+                return df_count
+            case "binary-hard":
+                return (df_count > 0).astype(int)
+            case "tfidf":
+                try:
+                    from sklearn.feature_extraction.text import TfidfTransformer
+                    tfidf = TfidfTransformer(norm='l2', use_idf=True, smooth_idf=True, sublinear_tf=False)
+                    values = tfidf.fit_transform(df_count.values).toarray()
+                    df_tfidf = pd.DataFrame(values, index=df_count.index, columns=df_count.columns)
+                    return df_tfidf
+                except Exception as e:
+                    raise RuntimeError(f"Failed to compute TF-IDF: {e}")
 
     score_lists: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
     all_skills = set()
@@ -392,7 +1955,11 @@ def inventor_archetype_memberships(
         when `n_archetypes == -1`. If 1, only `random_state` is used.
 
     backend : {"numpy","jax","torch"}
-        Which backend to use from the `archetypes` package.
+        Backend selector.
+        - "numpy"/"jax": uses `AA(...).fit(X)` estimator path.
+        - "torch": uses installed `archetypes` torch module
+          `archetypes.torch._AA` or `archetypes.torch._aa` and calls
+          `archetypal_analysis`.
     init : str
         Initialization method for AA.
     max_iter : int
@@ -420,16 +1987,20 @@ def inventor_archetype_memberships(
     if inventor_skill_df is None or inventor_skill_df.empty:
         return pd.DataFrame()
 
+    output_dir_path = Path(output_dir).resolve()
     run_start_utc = datetime.now(timezone.utc)
     run_start_perf = time.perf_counter()
 
     # Select backend
+    AA_cls = None
+    torch_archetypal_analysis_fn = None
+    torch_backend_impl = None
     if backend == "numpy":
         from archetypes import AA as AA_cls
     elif backend == "jax":
         from archetypes.jax import AA as AA_cls
     elif backend == "torch":
-        from archetypes.torch import AA as AA_cls
+        torch_archetypal_analysis_fn, torch_backend_impl = _load_installed_torch_archetypal_analysis()
     else:
         raise ValueError("backend must be one of: 'numpy', 'jax', 'torch'")
 
@@ -444,6 +2015,11 @@ def inventor_archetype_memberships(
         "n_archetypes_requested": int(n_archetypes),
         "max_k": int(max_k),
         "n_init": int(n_init),
+        "torch_backend_impl": torch_backend_impl if backend == "torch" else None,
+        "torch_n_runs": int(n_init) if backend == "torch" else None,
+        "torch_epochs": int(max_iter) if backend == "torch" else None,
+        "torch_batch_size": 1 if backend == "torch" else None,
+        "torch_dtype": "float32" if backend == "torch" else None,
         "random_state": random_state,
         "alternative_random_seeds": list(alternative_random_seeds),
         "iter_per_num_archetypes": int(iter_per_num_archetypes),
@@ -452,12 +2028,17 @@ def inventor_archetype_memberships(
         "init": init,
         "max_iter": int(max_iter),
         "tol": float(tol),
-        "output_dir": str(Path(output_dir).resolve()),
+        "output_dir": str(output_dir_path),
         "save_repro_bundle": bool(save_repro_bundle),
         "repro_subdir": repro_subdir,
     }
     aa_core_params = {
         "backend": backend,
+        "torch_backend_impl": torch_backend_impl if backend == "torch" else None,
+        "torch_n_runs": int(n_init) if backend == "torch" else None,
+        "torch_epochs": int(max_iter) if backend == "torch" else None,
+        "torch_batch_size": 1 if backend == "torch" else None,
+        "torch_dtype": "float32" if backend == "torch" else None,
         "method": method,
         "init": init,
         "n_init": int(n_init),
@@ -512,26 +2093,79 @@ def inventor_archetype_memberships(
                     "max_iter_optimizer": 5000,
                 },
             )
+            fit_start = time.perf_counter()
+            aa.fit(X)
+            fit_seconds = float(time.perf_counter() - fit_start)
+            rss_val = _compute_rss(aa, X)
+            n_iter = int(getattr(aa, "n_iter_", -1))
+            return aa, rss_val, fit_seconds, n_iter
         elif backend == "torch":
-            aa = AA_cls(
-                n_archetypes=k,
-                max_iter=max_iter,
-                tol=tol,
-                init=init,
-                device='cuda' if backend == "torch" else None,
-                method_kwargs={
-                    "max_iter_optimizer": 5000,
-                },
+            if torch_archetypal_analysis_fn is None:
+                raise RuntimeError("Torch backend requested but installed archetypal_analysis function is not available.")
+            try:
+                import torch
+            except Exception as exc:
+                raise RuntimeError(f"Torch backend requested, but torch is unavailable: {exc}") from exc
+
+            torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            torch_epochs = max(1, int(max_iter))
+            torch_runs = max(1, int(n_init))
+
+            fit_start = time.perf_counter()
+            archetypes_t, proportions_t, mse_loss = torch_archetypal_analysis_fn(
+                X=X,
+                n_archetypes=int(k),
+                n_runs=int(torch_runs),
+                verbose=False,
+                random_state=seed,
+                epochs=int(torch_epochs),
+                batch_size=10000,
+                device=torch_device,
+                dtype=torch.float32,
             )
+            fit_seconds = float(time.perf_counter() - fit_start)
+
+            coeff_np_raw = _to_numpy_array(proportions_t, dtype=np.float64)
+            if coeff_np_raw.shape == (int(k), int(n_samples)):
+                coeff_np = coeff_np_raw.T
+            elif coeff_np_raw.shape == (int(n_samples), int(k)):
+                coeff_np = coeff_np_raw
+            else:
+                raise RuntimeError(
+                    "Unexpected torch proportions shape. "
+                    f"Got {coeff_np_raw.shape}, expected {(int(n_samples), int(k))} "
+                    f"or {(int(k), int(n_samples))}."
+                )
+
+            archetypes_np_raw = _to_numpy_array(archetypes_t, dtype=np.float64)
+            if archetypes_np_raw.shape == (int(k), int(n_features)):
+                archetypes_np = archetypes_np_raw
+            elif archetypes_np_raw.shape == (int(n_features), int(k)):
+                archetypes_np = archetypes_np_raw.T
+            else:
+                raise RuntimeError(
+                    "Unexpected torch archetypes shape. "
+                    f"Got {archetypes_np_raw.shape}, expected {(int(k), int(n_features))} "
+                    f"or {(int(n_features), int(k))}."
+                )
+            x_hat = coeff_np @ archetypes_np
+            residual = X - x_hat
+            rss_val = float(np.sum(residual * residual))
+            n_iter = int(torch_epochs)
+
+            aa = types.SimpleNamespace(
+                coefficients_=coeff_np,
+                archetypes_=archetypes_np,
+                arch_coefficients_=np.array([], dtype=np.float64),
+                labels_=np.argmax(coeff_np, axis=1).astype(int) if coeff_np.size else np.array([], dtype=int),
+                loss_=np.array([float(mse_loss)], dtype=np.float64),
+                rss_=rss_val,
+                n_iter_=n_iter,
+                backend_impl_=torch_backend_impl,
+            )
+            return aa, rss_val, fit_seconds, n_iter
         else:
             raise ValueError("backend must be one of: 'numpy', 'jax', 'torch'")
-
-        fit_start = time.perf_counter()
-        aa.fit(X)
-        fit_seconds = float(time.perf_counter() - fit_start)
-        rss_val = _compute_rss(aa, X)
-        n_iter = int(getattr(aa, "n_iter_", -1))
-        return aa, rss_val, fit_seconds, n_iter
 
     memberships_df: pd.DataFrame
     final_model: Optional[Any] = None
@@ -546,6 +2180,8 @@ def inventor_archetype_memberships(
     k_sweep_summary_records: List[Dict[str, Any]] = []
     fixed_run_fit_seconds: Optional[float] = None
     fixed_run_n_iter: Optional[int] = None
+    repro_root: Optional[Path] = None
+    run_dir: Optional[Path] = None
 
     # Case 1: user specified a fixed number of archetypes
     if n_archetypes != -1:
@@ -747,11 +2383,9 @@ def inventor_archetype_memberships(
 
         # Keep legacy top-level elbow plot behavior for auto mode.
         try:
-            out_dir_path = Path(output_dir)
-            out_dir_path.mkdir(parents=True, exist_ok=True)
             if candidate_ks and mean_rss_per_k:
                 _save_elbow_plot(
-                    fig_path=out_dir_path / "elbow_n_archetypes.png",
+                    fig_path=output_dir_path / "elbow_n_archetypes.png",
                     candidate_ks=candidate_ks,
                     mean_rss_per_k=mean_rss_per_k,
                     best_k=selected_k,
@@ -781,7 +2415,6 @@ def inventor_archetype_memberships(
 
     if save_repro_bundle:
         try:
-            output_dir_path = Path(output_dir).resolve()
             repro_root = output_dir_path / repro_subdir
             repro_root.mkdir(parents=True, exist_ok=True)
             run_dir = repro_root / run_id
@@ -927,6 +2560,59 @@ def inventor_archetype_memberships(
             )
         except Exception as exc:
             print(f"[WARN] Failed to save reproducibility bundle: {exc}")
+
+    postprocess_random_state = int(random_state if random_state is not None else 42)
+    effective_config = (experiment_metadata or {}).get("effective_config", {}) if experiment_metadata else {}
+    max_inventors_tsne_value = effective_config.get(
+        "max_inventors_tsne",
+        effective_config.get("archetypes_plots_max_inventors_tsne", 10000),
+    )
+    max_inventors_tsne = int(max_inventors_tsne_value) if max_inventors_tsne_value is not None else 6000
+
+    coefficients = _to_numpy_array(getattr(final_model, "coefficients_", None), dtype=np.float64)
+    archetypes = _to_numpy_array(getattr(final_model, "archetypes_", None), dtype=np.float64)
+    feature_names = [str(col) for col in inventor_skill_df.columns.tolist()]
+    inventor_index = pd.Index(inventor_skill_df.index)
+
+    if coefficients.ndim == 2 and archetypes.ndim == 2:
+        postprocess_metadata = {
+            "base_dir": str(output_dir_path),
+            "run_id": run_id,
+            "run_mode": run_mode,
+            "run_dir": str(run_dir) if run_dir is not None else None,
+            "repro_root": str(repro_root) if repro_root is not None else None,
+            "selected_k": int(selected_k),
+            "elbow_method": elbow_method,
+        }
+
+        try:
+            _run_archetype_optical_analysis_current(
+                inventor_skill_df=inventor_skill_df,
+                memberships_df=memberships_df,
+                archetypes=archetypes,
+                inventor_index=inventor_index,
+                feature_names=feature_names,
+                selected_k=int(selected_k),
+                output_dir=output_dir_path / "archetypes_plots",
+                random_state=postprocess_random_state,
+                max_inventors_tsne=max_inventors_tsne,
+                metadata=postprocess_metadata,
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to generate archetypes_plots outputs: {exc}")
+
+        try:
+            _run_archetype_interpretation(
+                archetypes=archetypes,
+                feature_names=feature_names,
+                selected_k=int(selected_k),
+                output_dir=output_dir_path / "archetypes_interpretation",
+                metadata=postprocess_metadata,
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to generate archetypes_interpretation outputs: {exc}")
+    else:
+        print("[WARN] Skipping archetype post-processing because fitted model outputs are not 2D matrices.")
 
     return memberships_df
 
