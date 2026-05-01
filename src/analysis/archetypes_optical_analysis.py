@@ -13,8 +13,8 @@ Main visuals:
 
 Extra sparse-aware visuals added:
 - UMAP 2D/3D on raw inventor input matrix
-- TruncatedSVD(100) + UMAP 2D/3D
-- TruncatedSVD(100) + t-SNE 2D/3D
+- TruncatedSVD(n_components) + UMAP 2D/3D
+- TruncatedSVD(n_components) + t-SNE 2D/3D
 
 The plotted "X" markers are the actual archetypes, embedded in the same reduced
 space as the inventor input vectors. They are not cluster centers.
@@ -26,6 +26,9 @@ import argparse
 import json
 from pathlib import Path
 from typing import Dict, Tuple
+
+import matplotlib
+matplotlib.use("Agg", force=True)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -49,9 +52,13 @@ PLOT_STYLE = {
 }
 plt.rcParams.update(PLOT_STYLE)
 
-DEFAULT_BASE_DIR = Path("/home/nikifori/Desktop/thesis/repo/output/all_data_dedupled_tfidf_v3")
-DEFAULT_OUT_DIR = DEFAULT_BASE_DIR / "archetypes_plots_final_final_final_final_final"
+# DEFAULT_BASE_DIR = Path("/home/nikifori/Desktop/thesis/repo/output/all_data_dedupled_tfidf_v3")
+DEFAULT_BASE_DIR = Path("/home/nikifori/Desktop/thesis/repo/output/all_data_deduped_gpt_filtered_binary_hard")
+DEFAULT_OUT_DIR = DEFAULT_BASE_DIR / "archetypes_plots_final_max_points_100000_svd_125"
 
+DEFAULT_MAX_POINTS = 100000
+DEFAULT_SVD_N_COMPONENTS = 125
+DEFAULT_RANDOM_STATE = 42
 
 def _with_k_suffix(path: Path, selected_k: int) -> Path:
     return path.with_name(f"{path.stem}_k{selected_k}{path.suffix}")
@@ -475,7 +482,7 @@ def _fit_umap(matrix, n_components: int, random_state: int) -> np.ndarray:
     return reducer.fit_transform(matrix)
 
 
-def _safe_svd_components(n_rows: int, n_cols: int, target: int = 100) -> int:
+def _safe_svd_components(n_rows: int, n_cols: int, target: int = DEFAULT_SVD_N_COMPONENTS) -> int:
     return max(2, min(int(target), n_rows - 1, n_cols - 1))
 
 
@@ -678,7 +685,13 @@ def _plot_purity_histogram_by_archetype(
         plt.close(fig)
 
 
-def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, random_state: int) -> Path:
+def run_analysis(
+    base_dir: Path,
+    output_dir: Path,
+    max_inventors_tsne: int,
+    random_state: int,
+    svd_n_components: int = DEFAULT_SVD_N_COMPONENTS,
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     run = _load_latest_auto_run(base_dir / "archetype_runs" / "index.jsonl")
     run_dir = Path(run["run_dir"])
@@ -726,7 +739,7 @@ def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, rand
         out_path=_with_k_suffix(output_dir / "membership_simplex_plot.png", selected_k),
         k=selected_k,
         title="Simplex: Colored by Dominant Archetype",
-        max_points=4000,
+        max_points=max_inventors_tsne,
         random_state=random_state,
     )
 
@@ -883,14 +896,16 @@ def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, rand
         "UMAP c3",
     )
 
-    # 2) SVD(100) + UMAP
+    # 2) SVD + UMAP
+    requested_svd_n_components = int(svd_n_components)
     svd_n_components = _safe_svd_components(
         n_rows=n_joint,
         n_cols=joint_sparse.shape[1],
-        target=100,
+        target=requested_svd_n_components,
     )
-    svd_100 = TruncatedSVD(n_components=svd_n_components, random_state=random_state)
-    joint_svd = svd_100.fit_transform(joint_sparse)
+    svd_name = f"svd{svd_n_components}"
+    svd = TruncatedSVD(n_components=svd_n_components, random_state=random_state)
+    joint_svd = svd.fit_transform(joint_sparse)
 
     emb_umap_svd_all_2d = _fit_umap(joint_svd, n_components=2, random_state=random_state)
     emb_umap_svd_2d, emb_umap_svd_arch_2d = _split_joint_embedding(emb_umap_svd_all_2d, n_sample)
@@ -898,7 +913,7 @@ def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, rand
         emb_umap_svd_2d,
         emb_umap_svd_arch_2d,
         dominant_sample,
-        _with_k_suffix(output_dir / "svd100_umap_2d_input.png", selected_k),
+        _with_k_suffix(output_dir / f"{svd_name}_umap_2d_input.png", selected_k),
         selected_k,
         f"Inventor Skill Input Space in SVD({svd_n_components}) + UMAP 2D (colored by dominant archetype)",
         "UMAP component 1",
@@ -911,7 +926,7 @@ def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, rand
         emb_umap_svd_3d,
         emb_umap_svd_arch_3d,
         dominant_sample,
-        _with_k_suffix(output_dir / "svd100_umap_3d_input.png", selected_k),
+        _with_k_suffix(output_dir / f"{svd_name}_umap_3d_input.png", selected_k),
         selected_k,
         f"Inventor Skill Input Space in SVD({svd_n_components}) + UMAP 3D (colored by dominant archetype)",
         "UMAP c1",
@@ -919,7 +934,7 @@ def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, rand
         "UMAP c3",
     )
 
-    # 3) SVD(100) + t-SNE
+    # 3) SVD + t-SNE
     perplexity_svd_tsne = min(35, max(5, n_joint // 40))
     if perplexity_svd_tsne >= n_joint:
         perplexity_svd_tsne = max(1, n_joint - 1)
@@ -937,7 +952,7 @@ def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, rand
         emb_svd_tsne_2d,
         emb_svd_tsne_arch_2d,
         dominant_sample,
-        _with_k_suffix(output_dir / "svd100_tsne_2d_input.png", selected_k),
+        _with_k_suffix(output_dir / f"{svd_name}_tsne_2d_input.png", selected_k),
         selected_k,
         f"Inventor Skill Input Space in SVD({svd_n_components}) + t-SNE 2D (colored by dominant archetype)",
         "t-SNE component 1",
@@ -957,7 +972,7 @@ def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, rand
         emb_svd_tsne_3d,
         emb_svd_tsne_arch_3d,
         dominant_sample,
-        _with_k_suffix(output_dir / "svd100_tsne_3d_input.png", selected_k),
+        _with_k_suffix(output_dir / f"{svd_name}_tsne_3d_input.png", selected_k),
         selected_k,
         f"Inventor Skill Input Space in SVD({svd_n_components}) + t-SNE 3D (colored by dominant archetype)",
         "t-SNE c1",
@@ -1009,8 +1024,9 @@ def run_analysis(base_dir: Path, output_dir: Path, max_inventors_tsne: int, rand
         "umap_metric": "cosine",
         "umap_n_neighbors": 30,
         "umap_min_dist": 0.10,
+        "svd_n_components_requested_for_sparse_plots": int(requested_svd_n_components),
         "svd_n_components_for_sparse_plots": int(svd_n_components),
-        "svd_explained_variance_ratio_sum": float(np.sum(svd_100.explained_variance_ratio_)),
+        "svd_explained_variance_ratio_sum": float(np.sum(svd.explained_variance_ratio_)),
         "random_state": int(random_state),
         "membership_simplex_basis": "AA memberships projected with archetypes.visualization.simplex.simplex",
         "purity_definition": "max normalized AA membership per inventor",
@@ -1110,8 +1126,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Optical analysis for archetype run outputs.")
     parser.add_argument("--base_dir", type=Path, default=DEFAULT_BASE_DIR)
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--max_inventors_tsne", type=int, default=6000)
-    parser.add_argument("--random_state", type=int, default=42)
+    parser.add_argument("--max_inventors_tsne", type=int, default=DEFAULT_MAX_POINTS)
+    parser.add_argument("--svd_n_components", type=int, default=DEFAULT_SVD_N_COMPONENTS)
+    parser.add_argument("--random_state", type=int, default=DEFAULT_RANDOM_STATE)
     args = parser.parse_args()
 
     out = run_analysis(
@@ -1119,6 +1136,7 @@ def main() -> None:
         output_dir=args.output_dir.resolve(),
         max_inventors_tsne=int(args.max_inventors_tsne),
         random_state=int(args.random_state),
+        svd_n_components=int(args.svd_n_components),
     )
     print(f"[INFO] Archetype optical analysis outputs: {out}")
 

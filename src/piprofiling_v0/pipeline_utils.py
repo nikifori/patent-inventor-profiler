@@ -772,7 +772,7 @@ def _aa_plot_membership_simplex(
     out_path: Path,
     k: int,
     title: str,
-    max_points: int = 4000,
+    max_points: int = 40000,
     random_state: int = 42,
 ) -> None:
     memberships = np.asarray(memberships, dtype=float)
@@ -1261,7 +1261,7 @@ def _run_archetype_optical_analysis_current(
             out_path=_aa_with_k_suffix(output_dir / "membership_simplex_plot.png", selected_k),
             k=selected_k,
             title="Simplex: Colored by Dominant Archetype",
-            max_points=4000,
+            max_points=40000,
             random_state=random_state,
         )
         _aa_save_membership_simplex_vertices_csv(
@@ -2565,9 +2565,9 @@ def inventor_archetype_memberships(
     effective_config = (experiment_metadata or {}).get("effective_config", {}) if experiment_metadata else {}
     max_inventors_tsne_value = effective_config.get(
         "max_inventors_tsne",
-        effective_config.get("archetypes_plots_max_inventors_tsne", 10000),
+        effective_config.get("archetypes_plots_max_inventors_tsne", 40000),
     )
-    max_inventors_tsne = int(max_inventors_tsne_value) if max_inventors_tsne_value is not None else 6000
+    max_inventors_tsne = int(max_inventors_tsne_value) if max_inventors_tsne_value is not None else 40000
 
     coefficients = _to_numpy_array(getattr(final_model, "coefficients_", None), dtype=np.float64)
     archetypes = _to_numpy_array(getattr(final_model, "archetypes_", None), dtype=np.float64)

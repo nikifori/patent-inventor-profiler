@@ -46,10 +46,10 @@ PALETTE = [
 ]
 
 DEFAULT_INPUT = Path(
-    "/home/nikifori/Desktop/thesis/repo/output/all_data_dedupled_tfidf_v3/patent_X_skills.csv"
+    "/home/nikifori/Desktop/thesis/repo/output/all_data_deduped_gpt_filtered_tfidf/patent_X_skills.csv"
 )
 DEFAULT_OUTPUT = Path(
-    "/home/nikifori/Desktop/thesis/repo/output/patent_skills_eda/v1"
+    "/home/nikifori/Desktop/thesis/repo/output/patent_skills_eda/v2"
 )
 
 
