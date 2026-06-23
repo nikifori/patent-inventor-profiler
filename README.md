@@ -189,22 +189,4 @@ python src/analysis/inventor_skills_eda.py   --input_csv <run>/patent_X_inventor
 
 The pipeline is deterministic: fixed seed (42), NNLS archetype optimization with 10 restarts,
 conservative LLM decoding (temperature 0.1), and saved snapshots/reports at each preprocessing
-step. Skill extraction uses the GPU when available; the Archetypal Analysis backend is selectable
-(`torch` / `jax` / `numpy`) via the config.
-
-## Citation
-
-```bibtex
-@article{nikiforidis_patent_inventor_profiler,
-  title  = {The I-Files: Formulating Patent Inventor Skill Profiles via Granted Patent Records},
-  author = {Nikiforidis, Konstantinos and Georgiou, Konstantinos and
-            Kavargyris, Dimitrios Christos and Angelis, Lefteris},
-  school = {Aristotle University of Thessaloniki, School of Informatics},
-  year   = {2026}
-}
-```
-
-## Authors
-
-Konstantinos Nikiforidis · Konstantinos Georgiou · Dimitrios Christos Kavargyris ·
-Lefteris Angelis (supervisor)
+step. Skill extraction uses the GPU when available;
