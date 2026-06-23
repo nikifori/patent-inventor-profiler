@@ -1451,7 +1451,7 @@ def _run_archetype_optical_analysis_current(
     joint_svd = None
     perplexity_svd_tsne = None
     try:
-        svd_n_components = _aa_safe_svd_components(n_rows=n_joint, n_cols=joint_sparse.shape[1], target=100)
+        svd_n_components = _aa_safe_svd_components(n_rows=n_joint, n_cols=joint_sparse.shape[1], target=125)
         svd_100 = TruncatedSVD(n_components=svd_n_components, random_state=random_state)
         joint_svd = svd_100.fit_transform(joint_sparse)
         svd_explained_variance_ratio_sum = float(np.sum(svd_100.explained_variance_ratio_))
@@ -1492,7 +1492,7 @@ def _run_archetype_optical_analysis_current(
         except Exception as exc:
             print(f"[WARN] Failed to generate SVD+UMAP 3D plot: {exc}")
 
-        perplexity_svd_tsne = min(35, max(5, n_joint // 40))
+        perplexity_svd_tsne = min(100, max(5, n_joint // 40))
         if perplexity_svd_tsne >= n_joint:
             perplexity_svd_tsne = max(1, n_joint - 1)
 
@@ -1879,7 +1879,9 @@ def build_inventor_skill_df(
 
         match mode:
             case "hard":
-                return df_count
+                # return df_count
+                df_hard = np.log1p(df_count.astype(float))
+                return df_hard
             case "binary-hard":
                 return (df_count > 0).astype(int)
             case "tfidf":

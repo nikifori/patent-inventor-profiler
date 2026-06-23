@@ -53,12 +53,13 @@ PLOT_STYLE = {
 plt.rcParams.update(PLOT_STYLE)
 
 # DEFAULT_BASE_DIR = Path("/home/nikifori/Desktop/thesis/repo/output/all_data_dedupled_tfidf_v3")
-DEFAULT_BASE_DIR = Path("/home/nikifori/Desktop/thesis/repo/output/all_data_deduped_gpt_filtered_binary_hard")
-DEFAULT_OUT_DIR = DEFAULT_BASE_DIR / "archetypes_plots_final_max_points_100000_svd_125"
+DEFAULT_BASE_DIR = Path("/home/nikifori/Desktop/thesis/repo/output/all_data_deduped_gpt_filtered_hard")
+DEFAULT_OUT_DIR = DEFAULT_BASE_DIR / "archetypes_plots_final_max_points_100000_svd_125_perplexity_100"
 
 DEFAULT_MAX_POINTS = 100000
 DEFAULT_SVD_N_COMPONENTS = 125
 DEFAULT_RANDOM_STATE = 42
+MIN_PERPLEXITY = 100
 
 def _with_k_suffix(path: Path, selected_k: int) -> Path:
     return path.with_name(f"{path.stem}_k{selected_k}{path.suffix}")
@@ -756,7 +757,7 @@ def run_analysis(
     n_sample = input_sample.shape[0]
     n_joint = joint_matrix.shape[0]
 
-    perplexity = min(35, max(5, n_joint // 40))
+    perplexity = min(MIN_PERPLEXITY, max(5, n_joint // 40))
     if perplexity >= n_joint:
         perplexity = max(1, n_joint - 1)
 
@@ -935,7 +936,7 @@ def run_analysis(
     )
 
     # 3) SVD + t-SNE
-    perplexity_svd_tsne = min(35, max(5, n_joint // 40))
+    perplexity_svd_tsne = min(MIN_PERPLEXITY, max(5, n_joint // 40))
     if perplexity_svd_tsne >= n_joint:
         perplexity_svd_tsne = max(1, n_joint - 1)
 

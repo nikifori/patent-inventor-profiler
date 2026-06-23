@@ -12,7 +12,7 @@ model_skill_threshold: 0.6
 actual_skill_threshold: null # if null, the top-1 returned skill will be used. If set to a value, all returned skills will be filtered based on this threshold.
 batch_size: 1000
 link2skill_mapping_file: './resources/ESCO_link2skill_mapping.csv' # if None it will try to find the file in "project/resources/ESCO_link2skill_mapping.csv"
-inventor_vector_type: "binary-hard" # whether being "soft", "hard" or "tfidf" or "binary-hard"
+inventor_vector_type: "hard" # whether being "soft", "hard" or "tfidf" or "binary-hard"
 save_patent_X_skills_csv: true
 
 # archetypal analysis related parameters
@@ -28,6 +28,6 @@ init: "uniform" # see archetypes docs: 'uniform', 'furthest_sum', 'furthest_firs
 max_iter: 4000
 
 # output related parameters
-output_dir: "./output/all_data_deduped_gpt_filtered_binary_hard"
+output_dir: "./output/all_data_deduped_gpt_filtered_hard_log1p"
 
 # output_dir: "./output/all_data_dedupled_tfidf_v4"
