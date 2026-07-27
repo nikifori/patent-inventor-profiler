@@ -51,7 +51,7 @@ DEFAULT_INPUT = Path(
 )
 
 DEFAULT_OUTPUT = Path(
-    "/home/nikifori/Desktop/thesis/repo/output/inventor_skills_eda/v2"
+    "/home/nikifori/Desktop/thesis/repo/output/inventor_skills_eda/v3"
 )
 
 
@@ -208,6 +208,8 @@ def run_eda(input_csv: Path, output_dir: Optional[Path], top_n: int) -> Path:
     top_skills_per_year = yearly_skill_counts[yearly_skill_counts["rank_within_year"] <= top_n].copy()
     top_skills_per_year.to_csv(out_dir / "top_skills_per_year.csv", index=False)
 
+    score_below_06_mask = df["score"] < 0.6
+
     summary = {
         "input_csv": str(input_csv),
         "rows_after_cleaning": int(len(df)),
@@ -217,9 +219,24 @@ def run_eda(input_csv: Path, output_dir: Optional[Path], top_n: int) -> Path:
         "score_median": float(df["score"].median()),
         "score_min": float(df["score"].min()),
         "score_max": float(df["score"].max()),
+        "score_below_0.6_share": float(score_below_06_mask.mean()),
+        "score_below_0.6_count": int(score_below_06_mask.sum()),
         "year_min": int(df["year"].dropna().min()) if df["year"].notna().any() else None,
         "year_max": int(df["year"].dropna().max()) if df["year"].notna().any() else None,
     }
+
+    if patent_col is not None:
+        patents_per_inventor = inventor_stats["unique_patents"].dropna()
+        summary["patents_per_inventor_median"] = float(patents_per_inventor.median())
+        summary["patents_per_inventor_mean"] = float(patents_per_inventor.mean())
+        summary["single_patent_inventor_share"] = float((patents_per_inventor == 1).mean())
+        summary["single_patent_inventor_count"] = int((patents_per_inventor == 1).sum())
+    else:
+        summary["patents_per_inventor_median"] = None
+        summary["patents_per_inventor_mean"] = None
+        summary["single_patent_inventor_share"] = None
+        summary["single_patent_inventor_count"] = None
+
     with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True, ensure_ascii=True)
 

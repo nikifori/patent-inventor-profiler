@@ -2091,7 +2091,7 @@ def inventor_archetype_memberships(
                 init=init,
                 random_state=seed,
                 method=method,
-                method_kwargs={
+                method_params={
                     "max_iter_optimizer": 5000,
                 },
             )
